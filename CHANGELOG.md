@@ -47,11 +47,24 @@ found by diffing against a working reference implementation.
 
 ### Known issue
 
-Authentication still fails at the AUTHENTICATE message. The server's flags
-(`0xE28A8235`) include `NEGOTIATE_KEY_EXCHANGE`, so MS-NLMP 3.1.5.1 requires the
-AUTHENTICATE to carry a message integrity code and an encrypted random session
-key. Both are currently absent, which is the likely cause of the remaining
-`SEC_E_INVALID_TOKEN`.
+Nothing is known broken in the protocol path. **NTLM authentication now
+completes**: the server accepts the AUTHENTICATE and answers
+`STATUS_LOGON_FAILURE` (`0xC000006D`) instead of `SEC_E_INVALID_TOKEN`
+(`0x80090308`), which is the correct answer for a wrong password. The CredSSP
+exchange works end to end and only the credential is outstanding;
+`rdpprobe` reads it from `RDP_PASSWORD`.
+
+- The AUTHENTICATE now carries what `NEGOTIATE_KEY_EXCHANGE` requires
+  (MS-NLMP 3.1.5.1.2, 3.4.4): a 16-byte random session key, its RC4-wrapped
+  `EncryptedRandomSessionKey`, and a message integrity code over all three
+  messages.
+- `Rc4` is implemented directly, since .NET no longer ships one and NTLM uses it
+  as a raw key schedule with no derivation.
+
+Two details were wrong at first and are recorded because both produce a
+plausible message rather than an error: the MIC is keyed with the *session key*,
+not the session base key, and `EncryptedRandomSessionKey` is
+`RC4(SessionBaseKey, SessionKey)` and is not optional.
 
 ### Settled
 

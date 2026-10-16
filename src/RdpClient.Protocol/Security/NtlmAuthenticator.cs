@@ -91,13 +91,30 @@ public sealed class NtlmAuthenticator
         byte[] ntlmResponse = Ntlm.ComputeNtlmV2Response(
             ntHash, _userName, _domain, challenge.ServerChallenge.Span, targetInfo, clientChallenge);
 
+        // MS-NLMP 3.4.4.1: when the server sets NEGOTIATE_KEY_EXCHANGE the client
+        // contributes 16 random bytes as the session key and sends an encrypted
+        // copy, which is what the server unwraps to derive the same value.
+        bool keyExchange = challenge.Flags.HasFlag(NtlmFlags.NegotiateKeyExchange);
+        byte[] sessionBaseKey = Ntlm.ComputeSessionBaseKey(
+            ntlmResponse, (NtlmFlags)BitConverter.ToUInt32(negotiate, 12));
+        byte[] sessionKey = keyExchange ? RandomNumberGenerator.GetBytes(16) : sessionBaseKey;
+        byte[] encryptedSessionKey = Ntlm.ExportSessionKey(sessionBaseKey, sessionKey);
+
         byte[] authenticate = Ntlm.BuildAuthenticateMessage(
             _userName,
             _domain,
             _workstation,
             ntlmResponse,
             challenge.Flags & NtlmFlags.NegotiateUnicode,
-            challenge.ServerChallenge.Span);
+            challenge.ServerChallenge.Span,
+            encryptedSessionKey);
+
+        // MS-NLMP 3.1.5.1.2: the MIC covers all three messages and is keyed with
+        // the session key, not the session base key. Without it the server
+        // cannot tell an unmodified exchange from a tampered one and answers
+        // SEC_E_INVALID_TOKEN.
+        Ntlm.ComputeMic(sessionKey, negotiate, challengeToken, authenticate)
+            .CopyTo(authenticate.AsSpan(Ntlm.MicOffset));
 
         await WriteRequestAsync(channel, [authenticate], cancellationToken).ConfigureAwait(false);
 

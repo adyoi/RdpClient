@@ -68,6 +68,12 @@ public enum NtlmAvPair : ushort
 /// </remarks>
 public static class Ntlm
 {
+    /// <summary>Offset of the message integrity code in an AUTHENTICATE (MS-NLMP 2.2.1.3).</summary>
+    public const int MicOffset = 72;
+
+    /// <summary>Length of the message integrity code.</summary>
+    public const int MicLength = 16;
+
     internal static ReadOnlySpan<byte> Signature => "NTLMSSP\0"u8;
 
     /// <summary>
@@ -284,8 +290,75 @@ public static class Ntlm
         return offset + field.Length;
     }
 
+        /// <summary>
+    /// Derive the NTLMv2 session base key (MS-NLMP 3.4.4.2).
+    /// </summary>
+    /// <remarks>
+    /// <c>T = HMAC_MD5(NTLMv2_Response, ProfferedNegotiateFlags)[0..16]</c>.
+    /// The flags are the ones this client sent in NEGOTIATE, not the ones the
+    /// server returned, and they are hashed as 4 little-endian bytes.
+    /// </remarks>
+    /// <param name="ntlmResponse">The NTLMv2 challenge response.</param>
+    /// <param name="profferedFlags">The <c>NegotiateFlags</c> this client sent.</param>
+    public static byte[] ComputeSessionBaseKey(ReadOnlySpan<byte> ntlmResponse, NtlmFlags profferedFlags)
+    {
+        using var hmac = new HMACMD5(ntlmResponse.ToArray());
+        byte[] hash = hmac.ComputeHash(BitConverter.GetBytes((uint)profferedFlags));
+        return hash[..16];
+    }
+
     /// <summary>
-    /// Compute the NTLMv2 challenge response (MS-NLMP 3.3.2).
+    /// Compute the message integrity code for an AUTHENTICATE (MS-NLMP 3.1.5.1.2).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <c>MAC = HMAC_MD5(SessionBaseKey, NEGOTIATE || CHALLENGE || AUTHENTICATE)</c>
+    /// where the AUTHENTICATE copy has its MIC field zeroed and, when
+    /// <see cref="NtlmFlags.NegotiateKeyExchange"/> is in force, its
+    /// EncryptedRandomSessionKey zeroed too.
+    /// </para>
+    /// <para>
+    /// The key is the session <em>base</em> key, not the session key.
+    /// </para>
+    /// </remarks>
+    /// <param name="sessionBaseKey">From <see cref="ComputeSessionBaseKey"/>.</param>
+    /// <param name="negotiate">The NEGOTIATE message as sent.</param>
+    /// <param name="challenge">The CHALLENGE message as received.</param>
+    /// <param name="authenticate">The AUTHENTICATE message as sent, MIC zeroed.</param>
+    public static byte[] ComputeMic(
+        ReadOnlySpan<byte> sessionBaseKey,
+        ReadOnlySpan<byte> negotiate,
+        ReadOnlySpan<byte> challenge,
+        ReadOnlySpan<byte> authenticate)
+    {
+        using var hmac = new HMACMD5(sessionBaseKey.ToArray());
+
+        var concatenated = new byte[negotiate.Length + challenge.Length + authenticate.Length];
+        negotiate.CopyTo(concatenated);
+        challenge.CopyTo(concatenated.AsSpan(negotiate.Length));
+        authenticate.CopyTo(concatenated.AsSpan(negotiate.Length + challenge.Length));
+
+        return hmac.ComputeHash(concatenated);
+    }
+
+    /// <summary>
+    /// Wrap the client session key for the AUTHENTICATE (MS-NLMP 3.4.4.1).
+    /// </summary>
+    /// <remarks>
+    /// <c>ExportedSessionKey(RandomSessionKey) = RC4K(SessionBaseKey, RandomSessionKey)</c>
+    /// when the server exported no key of its own, and this value is also what
+    /// the resulting session key becomes. It is sent in the AUTHENTICATE's
+    /// EncryptedRandomSessionKey field and is <em>not</em> optional: a server
+    /// that sets <see cref="NtlmFlags.NegotiateKeyExchange"/> expects it.
+    /// </remarks>
+    /// <param name="sessionBaseKey">From <see cref="ComputeSessionBaseKey"/>.</param>
+    /// <param name="sessionKey">16 random bytes from the client.</param>
+    public static byte[] ExportSessionKey(
+        ReadOnlySpan<byte> sessionBaseKey,
+        ReadOnlySpan<byte> sessionKey) =>
+        Rc4.Transform(sessionBaseKey, sessionKey);
+
+    /// <summary>Compute the NTLMv2 challenge response (MS-NLMP 3.3.2).
     /// </summary>
     /// <param name="ntHash">The NT hash of the account password.</param>
     /// <param name="userName">Account name; uppercased into the key derivation.</param>
