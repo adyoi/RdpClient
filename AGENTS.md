@@ -109,6 +109,29 @@ reason `docs/protocol.md` exists; read it before touching an encoder.
    The offset is 32-bit. Reading Length from `[4..6]` and Offset from `[6..8]`
    takes the two halves of the offset instead, which silently yields the offset
    as the length and zero as the offset.
+9. **A structure must be as long as the length field it declares.** The NTLM
+   `BufferOffset` above is 4 octets and had to be written as 4. Likewise
+   `RDP_CORRELATION_INFO` declares 36 while its named fields occupy 24, so the
+   block is padded. xrdp walks the declared length and aborts with
+   `Not enough bytes in the stream: expected 35, remaining 23`; Windows ignores
+   the discrepancy, so only a second implementation catches this class of
+   defect.
+
+## A second server is how encoding bugs get caught
+
+Windows tolerates more than the specification forbids, and both `mstsc.exe` and
+FreeRDP skip the optional structures entirely, so testing against Windows alone
+cannot settle whether an encoding is right. xrdp is strict about declared
+lengths and names the structure it was parsing in its log, which is what turned
+the correlation block from a guess into a measurement:
+
+```bash
+wsl -d Ubuntu-26.04 -- tail -40 /var/log/xrdp.log
+```
+
+Read that log before forming a theory, exactly as the Windows event log is read
+above. [docs/wsl-rdp-lab.md](docs/wsl-rdp-lab.md) is the full setup, including
+the desktop choices and the idle-shutdown trap.
 
 ## Verifying a wire-format change
 

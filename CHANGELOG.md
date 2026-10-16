@@ -10,8 +10,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The CredSSP envelope, which was missing entirely, plus three encoding defects
 found by diffing against a working reference implementation.
 
+### Added
+
+- **The connection log can be copied.** The header now carries `Copy log` and
+  `Clear`. The copied text starts with the target, stage and account, because a
+  pasted log that says which host and stage it came from is what makes a report
+  actionable. The password is never in the log and never in the copy; the
+  authenticator's protocol hex is, so the button says so in its tooltip.
+  `Clear` existed in the view model but had no way to be pressed.
+
 ### Fixed
 
+- **`RDP_CORRELATION_INFO` was shorter than the length it declared.** The block
+  declares 36 octets but only the 24 named fields were sent. Windows tolerates
+  that; xrdp walks the declared length, fails with `Not enough bytes in the
+  stream: expected 35, remaining 23`, and drops the connection before
+  negotiation. The block is now padded, and `Negotiation.CorrelationInfoLength`
+  records the value. Verified against both: xrdp goes from a 9-byte
+  `DisconnectProviderUltimatum` to a Connection Confirm selecting
+  `PROTOCOL_SSL` and a completed TLS 1.3 handshake, while the Windows host is
+  unchanged. A capture of `mstsc.exe` shows it never sends this block, which is
+  why the defect survived: nothing in the Windows path exercises the encoding.
+- **The NTLM field-descriptor offset was written as 16 bits.** Each descriptor
+  is `{ Length(2), MaxLen(2), BufferOffset(4) }`, so the BufferOffset occupies
+  four octets, exactly as `ReadField` reads it. The writer emitted only two, and
+  a BufferOffset above 65535 would have been truncated without the reader ever
+  noticing. Both the AUTHENTICATE and the NEGOTIATE encoders now write four.
+- **`Slice` could overflow while checking a bounds offset.** The check added
+  `offset + length` in 32-bit arithmetic, which wraps for a large offset and can
+  pass a slice the message cannot contain. The bounds are now compared without
+  the sum.
+- Removed the unused `Ntlm.Append` helper; it had no callers.
+- **DER length and INTEGER octets were collected back-to-front.** The CredSSP
+  encoder built each octet list with `Insert(0, …)`, which shifts the whole list
+  on every insert. It now collects least-significant first and reverses once.
+  The bytes produced are unchanged.
 - **The CredSSP `TSRequest` envelope was absent.** The client wrote a bare token
   straight onto the TLS channel. CredSSP (MS-CSSP 2.2.1) requires every message
   after the handshake to be an ASN.1 `TSRequest` carrying the token in
@@ -99,6 +132,15 @@ declared value matches.
   SPNEGO wrappers) inside CredSSP when Kerberos is not possible"* - and its
   reference `TSRequest` vector begins with a bare `NTLMSSP` signature inside
   `negoToken`.
+
+### Tests
+
+- Two regression tests pin the fixes above. One builds an AUTHENTICATE whose
+  user name pushes the following offsets past 65535 and asserts the
+  `BufferOffset` octets are `e0 02 01 00`, which the old 16-bit write turned
+  into 736. The other builds a 300-byte CredSSP token, which forces the
+  two-octet DER length form `82 01 45` at the outermost level and reads it back.
+  Both were confirmed to fail against the unfixed encoders.
 
 ### Investigation
 

@@ -210,6 +210,7 @@ docs/                   Protocol notes, research, architecture
 | [docs/protocol.md](docs/protocol.md) | Field-by-field notes on each PDU, with spec sections |
 | [docs/architecture.md](docs/architecture.md) | Project structure and design decisions |
 | [docs/research.md](docs/research.md) | Analysis of `mstsc.exe` / `mstscax.dll` and what it revealed |
+| [docs/wsl-rdp-lab.md](docs/wsl-rdp-lab.md) | Standing up xrdp in WSL as a second server to test against |
 | [CHANGELOG.md](CHANGELOG.md) | Release history |
 
 ## Security
