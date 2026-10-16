@@ -87,7 +87,6 @@ public class NegotiationTests
         Random.Shared.NextBytes(correlation);
 
         byte[] request = Negotiation.BuildConnectionRequest(Rdp.ProtocolSsl, correlation);
-        Assert.Equal(43, request.Length);
 
         // MS-RDPBCGR 2.2.1.1.1: CORRELATION_INFO_PRESENT must accompany the block.
         Assert.Equal(0x08, request[12]);
@@ -95,6 +94,19 @@ public class NegotiationTests
         // The vector starts after TPKT(4) + X.224 fixed header(7) + RDP_NEG_REQ(8)
         // + the correlation block's own type/flags/length(4).
         Assert.Equal(correlation, request[23..39]);
+
+        // The block must be as long as the length it declares. xrdp walks 35
+        // octets after the type and aborts with "expected 35, remaining 23"
+        // when only the 24 named fields are present. Windows tolerates the
+        // short form, but mstsc.exe never sends the block at all, so nothing
+        // on the Windows side contradicts the stricter reader.
+        Assert.Equal(36, Negotiation.CorrelationInfoLength);
+        Assert.Equal(Negotiation.CorrelationInfoLength, BitConverter.ToUInt16(request, 21));
+        Assert.Equal(19 + Negotiation.CorrelationInfoLength, request.Length);
+
+        // The 12 octets of padding that bring the block up to its declared
+        // length are zero.
+        Assert.All(request[43..], b => Assert.Equal(0, b));
     }
 
     [Fact]

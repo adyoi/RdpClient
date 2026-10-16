@@ -70,8 +70,36 @@ narrower but still interoperable.
 | `length` | 2 | `0x0008` |
 | `requestedProtocols` | 4 | Protocol bitmask |
 
-Appending the optional correlation block makes the PDU 43 bytes and **requires**
+Appending the optional correlation block makes the PDU 55 bytes and **requires**
 raising `CORRELATION_INFO_PRESENT`.
+
+### Correlation block (2.2.1.1.2)
+
+| Field | Size | Value |
+| --- | --- | --- |
+| `type` | 1 | `0x06` `TYPE_RDP_CORRELATION_INFO` |
+| `flags` | 1 | `0x00` |
+| `length` | 2 | `0x0024` — **36**, larger than the fields it names |
+| `correlationInfo` | 16 | client-chosen vector |
+| `type` | 2 | `0x0001` `RPC_CORRELATION_VECTOR_INFO1` |
+| `Reserved` | 2 | `0x0000` |
+
+The named fields add up to 24 octets, but the structure declares 36, so the
+sent bytes must be padded to cover the length the client writes itself.
+Sending only the 24 named fields was accepted by Windows and rejected by xrdp,
+which walks `1 + 2 + 16 + 16` octets after the type and aborts the connection:
+
+```text
+Parsing [MS-RDPBCGR] RDP_NEG_CORRELATION_INFO Not enough bytes in the stream:
+expected 35, remaining 23
+```
+
+With the padding, xrdp answers with a Connection Confirm and selects
+`PROTOCOL_SSL` instead of dropping the connection.
+
+Note that `mstsc.exe` never sends this block at all — a capture of it through
+`tools/rdp-tap.mjs` shows the 19-byte request — and neither does FreeRDP, so a
+Windows host does not exercise the encoding either way.
 
 ### SelectedProtocol
 

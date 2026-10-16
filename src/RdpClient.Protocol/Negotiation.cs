@@ -16,6 +16,16 @@ public static class Negotiation
     private const int TpktHeaderLength = 4;
 
     /// <summary>
+    /// Declared size of RDP_CORRELATION_INFO (MS-RDPBCGR 2.2.1.1.2).
+    /// </summary>
+    /// <remarks>
+    /// The structure's own length field is 36, which is larger than the sum of
+    /// the fields it lists, so a conforming sender has to pad. See the comment
+    /// at the write site for the evidence.
+    /// </remarks>
+    public const int CorrelationInfoLength = 36;
+
+    /// <summary>
     /// Wrap a payload in a TPKT version 3 header.
     /// </summary>
     /// <remarks>
@@ -98,12 +108,29 @@ public static class Negotiation
                 throw new ArgumentException("correlationId must be 16 bytes", nameof(correlationId));
             }
 
+            int start = neg.Length;
             neg.U8(Rdp.NegReqTypeCorrelationInfo);
             neg.U8(0x00);
-            neg.U16(36);
+            neg.U16(CorrelationInfoLength);
             neg.Bytes(correlationId);
             neg.U16(0x0001); // RPC_CORRELATION_VECTOR_INFO1
             neg.U16(0x0000); // Reserved
+
+            // The fields above occupy 24 octets but the structure declares 36,
+            // so the bytes present must cover the length the client itself
+            // writes. xrdp walks 35 octets after the type and aborts the
+            // connection when they are not there:
+            //
+            //   Parsing [MS-RDPBCGR] RDP_NEG_CORRELATION_INFO Not enough bytes
+            //   in the stream: expected 35, remaining 23
+            //
+            // Windows tolerates the short form, which is why this survived: a
+            // capture of mstsc.exe shows it never sends the block at all, so
+            // there is no Windows-side evidence to contradict xrdp.
+            while (neg.Length - start < CorrelationInfoLength)
+            {
+                neg.U8(0x00);
+            }
         }
 
         byte[] negBytes = neg.ToArray();
