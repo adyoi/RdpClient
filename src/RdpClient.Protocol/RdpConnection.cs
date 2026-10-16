@@ -226,7 +226,11 @@ public sealed class RdpConnection : IAsyncDisposable
                     return HandshakeStage.Failed;
                 }
 
-                var authenticator = new NtlmAuthenticator(options.User.UserName, options.User.Domain, options.User.Password);
+                var authenticator = new NtlmAuthenticator(
+                    options.User.UserName,
+                    options.User.Domain,
+                    options.User.Password,
+                    trace: message => Report(HandshakeStage.TlsEstablished, message));
                 await authenticator.AuthenticateAsync(_channel, cancellationToken).ConfigureAwait(false);
                 Report(HandshakeStage.Authenticated,
                     $"NTLM authentication succeeded for '{authenticator.AuthenticatedUser}' in domain "

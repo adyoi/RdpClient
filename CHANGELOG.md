@@ -7,15 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-NTLM corrections, plus the investigation tooling that produced them.
+The CredSSP envelope, which was missing entirely, plus the investigation tooling
+that found it.
 
 ### Fixed
 
+- **The CredSSP `TSRequest` envelope was absent.** The client wrote a bare SPNEGO
+  token straight onto the TLS channel. CredSSP (MS-CSSP 2.2.1) requires every
+  message after the handshake to be an ASN.1 `TSRequest` carrying the token in
+  `negoTokens`; the server reads those first bytes as DER, fails, and closes the
+  connection with no diagnostic. `CredSsp.cs` encodes and decodes the structure,
+  and `NtlmAuthenticator` wraps each NTLM message in it.
 - `NEGOTIATE_TARGET_INFO` (`0x00800000`) was being set by the client. That flag
   announces that a message carries TargetInfo and is server-side; a client that
   sets it in NEGOTIATE is rejected.
 - `NEGOTIATE_VERSION` was set while the 8-octet Version field at offset 32 was
   left all zero, which is not a valid version.
+
+### Changed
+
+- Authentication now traces what it sends and receives, so a failure names the
+  stage and the token type instead of surfacing as a flattened TLS error.
+
+### Known issue
+
+Authentication still fails. The host now returns `SEC_E_INVALID_TOKEN`
+(`0x80090308`) instead of resetting silently, which indicates it parses the
+envelope correctly and rejects the token inside it. The remaining defect is in
+the SPNEGO or NTLM content and is not yet identified; see the open question on
+the `NtlmFlags` values in `AGENTS.md`.
 
 ### Investigation
 
@@ -38,8 +58,24 @@ What it established, in order:
 Six hypotheses were tested and eliminated in the process: TPKT endianness, X.224
 field order, the SPNEGO OID encoding, GSS-API tagging, the TLS version, and the
 NTLM field offsets. Each was a real defect, and each was fixed, but none was the
-cause. The host sends nothing that would explain the rejection, so without a
-known-good reference token the remaining cause cannot be narrowed further.
+cause.
+
+The cause was found by reading the right binary and then asking the server
+directly, rather than by a seventh guess about the token:
+
+- `credssp.dll` is the CredSSP security provider (53 KB, "Microsoft CredSSP
+  Security Provider"). `SpInitializeSecurityContextW` in it assembles the
+  outgoing message, and its string table names `Negotiate`, the SSPI package
+  CredSSP negotiates through. That is where the `TSRequest` envelope is built.
+- `msv1_0.dll` validates NTLM messages and rejects anything that fails with
+  `0x80090308`; it also caps a message at `0xB48` bytes.
+- `secur32.dll` contains no NTLM and no CredSSP, only 123 strings. An earlier
+  search returning nothing there was correct, not a tool failure.
+- The host logs the real reason. Event 139 in
+  `Microsoft-Windows-RemoteDesktopServices-RdpCoreTS/Operational` reads
+  `The server security layer detected an error (0x80090308) in the protocol
+  stream`, which names the rejection that Schannel was hiding behind a TLS
+  error. This is the diagnostic to read before forming any theory.
 
 ### Security
 

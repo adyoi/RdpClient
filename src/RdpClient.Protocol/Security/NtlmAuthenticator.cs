@@ -6,10 +6,16 @@ namespace RdpClient.Protocol.Security;
 /// Runs the NTLM authentication exchange that CredSSP requires.
 /// </summary>
 /// <remarks>
-/// MS-NLMP 3.1.5.1 defines a three-message exchange. Each message is carried in
-/// a SPNEGO token over the TLS channel that <see cref="TlsChannel"/> has already
-/// established, so this type deals only in tokens and never touches the socket
-/// framing itself.
+/// <para>
+/// MS-NLMP 3.1.5.1 defines a three-message exchange. MS-CSSP 2.2.1 wraps each
+/// message in a <c>TSRequest</c>: the server reads the first bytes after the TLS
+/// handshake as ASN.1, so sending the NTLM message bare makes it reset the
+/// connection without a diagnostic.
+/// </para>
+/// <para>
+/// CredSSP performs its own mechanism negotiation, so the NTLM message travels
+/// unwrapped in <c>negoToken</c>. A SPNEGO layer here is rejected.
+/// </para>
 /// </remarks>
 public sealed class NtlmAuthenticator
 {
@@ -19,8 +25,14 @@ public sealed class NtlmAuthenticator
     private readonly string _domain;
     private readonly string _password;
     private readonly string _workstation;
+    private readonly Action<string>? _trace;
 
-    public NtlmAuthenticator(string userName, string domain, string password, string workstation = "RDPCLIENT")
+    public NtlmAuthenticator(
+        string userName,
+        string domain,
+        string password,
+        string workstation = "RDPCLIENT",
+        Action<string>? trace = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(userName);
         ArgumentNullException.ThrowIfNull(password);
@@ -30,6 +42,7 @@ public sealed class NtlmAuthenticator
         _domain = domain ?? string.Empty;
         _password = password;
         _workstation = workstation;
+        _trace = trace;
     }
 
     public string AuthenticatedUser => _userName;
@@ -45,32 +58,23 @@ public sealed class NtlmAuthenticator
     {
         ArgumentNullException.ThrowIfNull(channel);
 
-        // 1. NEGOTIATE wrapped in SPNEGO.
-        byte[] negotiate = Ntlm.BuildNegotiateMessage();
-        await WriteTokenAsync(channel, Spnego.BuildNegotiateToken(negotiate), cancellationToken)
+        // 1. NEGOTIATE, inside a TSRequest.
+        // Two layers, both required: CredSSP carries the message in a TSRequest
+        // (MS-CSSP 2.2.1) and negotiates through the SSPI "Negotiate" package,
+        // so the NTLM message itself travels inside a SPNEGO token. Dropping
+        // either one is rejected as SEC_E_INVALID_TOKEN (0x80090308).
+        byte[] negotiate = Spnego.BuildNegotiateToken(Ntlm.BuildNegotiateMessage());
+        await WriteRequestAsync(channel, [negotiate], cancellationToken).ConfigureAwait(false);
+
+        // 2. The server answers with a TSRequest carrying the CHALLENGE.
+        _trace?.Invoke("<- awaiting TSRequest");
+        CredSsp.Request challengeReply = await ReadRequestAsync(channel, cancellationToken)
             .ConfigureAwait(false);
+        _trace?.Invoke($"server sent TSRequest: {CredSsp.Describe(challengeReply)}");
+        CredSsp.TryThrowServerError(challengeReply);
 
-        // 2. The server answers with a CHALLENGE inside the response token.
-        byte[] challengeToken = await ReadTokenAsync(channel, cancellationToken).ConfigureAwait(false);
-        var first = Spnego.ParseServerToken(challengeToken);
-
-        if (first.NegResult is not (0 or 1))
-        {
-            throw new NtlmAuthenticationException(
-                $"server rejected the authentication mechanism (negResult {first.NegResult})");
-        }
-
-        if (first.ResponseToken is not null && Spnego.TryReadError(first.ResponseToken, out string? error))
-        {
-            throw new NtlmAuthenticationException($"server reported: {error}");
-        }
-
-        if (first.ResponseToken is null || first.ResponseToken.Length == 0)
-        {
-            throw new NtlmAuthenticationException("server sent no NTLM challenge");
-        }
-
-        var challenge = Ntlm.ParseChallengeMessage(first.ResponseToken);
+        byte[] challengeToken = SingleNegoToken(challengeReply, "NTLM challenge");
+        var challenge = Ntlm.ParseChallengeMessage(challengeToken);
 
         // 3. Compute NTLMv2 and send the AUTHENTICATE message.
         byte[] ntHash = Ntlm.NtHash(_password);
@@ -94,96 +98,120 @@ public sealed class NtlmAuthenticator
             challenge.Flags & NtlmFlags.NegotiateUnicode,
             challenge.ServerChallenge.Span);
 
-        await WriteTokenAsync(channel, Spnego.BuildAuthenticateToken(authenticate), cancellationToken)
-            .ConfigureAwait(false);
+        await WriteRequestAsync(
+            channel,
+            [Spnego.BuildAuthenticateToken(authenticate)],
+            cancellationToken).ConfigureAwait(false);
 
-        // 4. Final token: success, or a status the server reports.
-        byte[] resultToken = await ReadTokenAsync(channel, cancellationToken).ConfigureAwait(false);
-        var result = Spnego.ParseServerToken(resultToken);
+        // 4. Final request: success, or the NTSTATUS the server reports.
+        CredSsp.Request result = await ReadRequestAsync(channel, cancellationToken).ConfigureAwait(false);
+        CredSsp.TryThrowServerError(result);
 
-        if (result.ResponseToken is not null && Spnego.TryReadError(result.ResponseToken, out string? failure))
-        {
-            throw new NtlmAuthenticationException($"authentication failed: {failure}");
-        }
-
-        // A server that omits negResult has authenticated us; the absence of an
-        // error token is the success signal.
-        if (result.NegResult is 2 or 3)
-        {
-            throw new NtlmAuthenticationException(
-                $"authentication was not completed (negResult {result.NegResult})");
-        }
-    }
-
-    private static async Task WriteTokenAsync(Stream channel, byte[] token, CancellationToken cancellationToken)
-    {
-        // The BER header is already length-delimited, so the token is written as
-        // one unit; SslStream preserves message boundaries for our purposes.
-        await channel.WriteAsync(token, cancellationToken).ConfigureAwait(false);
-        await channel.FlushAsync(cancellationToken).ConfigureAwait(false);
+        // A server that authenticates us answers with a bare acknowledgement, so
+        // an absent errorCode is the success signal.
     }
 
     /// <summary>
-    /// Read exactly one BER SEQUENCE from the channel.
+    /// Send one <c>TSRequest</c>.
     /// </summary>
     /// <remarks>
-    /// Tokens arrive as a contiguous DER blob rather than a length-prefixed
-    /// frame, so the outer SEQUENCE header supplies the length.
+    /// The DER length prefix delimits the structure, so the request goes out as
+    /// a single write and no framing of our own is added.
     /// </remarks>
-    private static async Task<byte[]> ReadTokenAsync(Stream channel, CancellationToken cancellationToken)
+    private async Task WriteRequestAsync(
+        Stream channel,
+        IReadOnlyList<byte[]> negoTokens,
+        CancellationToken cancellationToken)
     {
-        // Tag and first length octet.
+        byte[] request = CredSsp.BuildRequest(negoTokens);
+        string kinds = string.Join(", ", negoTokens.Select(Ntlm.DescribeType));
+        _trace?.Invoke($"-> TSRequest {request.Length} bytes: {kinds}");
+        _trace?.Invoke($"   {Convert.ToHexString(request).ToLowerInvariant()}");
+        await channel.WriteAsync(request, cancellationToken).ConfigureAwait(false);
+        await channel.FlushAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static byte[] SingleNegoToken(CredSsp.Request request, string what)
+    {
+        if (request.NegoTokens.Count == 0)
+        {
+            throw new NtlmAuthenticationException($"the server sent no {what}");
+        }
+
+        byte[] token = request.NegoTokens[0];
+        string kind = Ntlm.DescribeType(token);
+        if (!kind.StartsWith("CHALLENGE", StringComparison.Ordinal))
+        {
+            throw new NtlmAuthenticationException(
+                $"expected an NTLM CHALLENGE but the server sent {kind}");
+        }
+
+        return token;
+    }
+
+    /// <summary>
+    /// Read exactly one <c>TSRequest</c> from the channel.
+    /// </summary>
+    /// <remarks>
+    /// Messages arrive as a contiguous DER blob rather than a length-prefixed
+    /// frame, so the outer SEQUENCE header supplies the length. The header is
+    /// kept and passed to the parser, which expects the full encoding.
+    /// </remarks>
+    private static async Task<CredSsp.Request> ReadRequestAsync(
+        Stream channel,
+        CancellationToken cancellationToken)
+    {
         byte[] prefix = await ReadExactAsync(channel, 2, cancellationToken).ConfigureAwait(false);
         if (prefix[0] != 0x30)
         {
             throw new NtlmAuthenticationException(
-                $"expected a SPNEGO SEQUENCE, got tag 0x{prefix[0]:x2}");
+                $"expected a CredSSP TSRequest SEQUENCE, got tag 0x{prefix[0]:x2}");
         }
 
         int headerLength;
         int contentLength;
+        byte[] lengthOctets;
 
         if ((prefix[1] & 0x80) == 0)
         {
             headerLength = 2;
             contentLength = prefix[1];
+            lengthOctets = [];
         }
         else
         {
-            int lengthOctets = prefix[1] & 0x7F;
-            if (lengthOctets is 0 or > 3)
+            int count = prefix[1] & 0x7F;
+            if (count is 0 or > 3)
             {
                 throw new NtlmAuthenticationException(
-                    $"unsupported SPNEGO token length form 0x{prefix[1]:x2}");
+                    $"unsupported CredSSP length form 0x{prefix[1]:x2}");
             }
 
-            headerLength = 2 + lengthOctets;
-            byte[] lengthBytes = await ReadExactAsync(channel, lengthOctets, cancellationToken)
-                .ConfigureAwait(false);
+            lengthOctets = await ReadExactAsync(channel, count, cancellationToken).ConfigureAwait(false);
+            headerLength = 2 + count;
 
             contentLength = 0;
-            foreach (byte b in lengthBytes)
+            foreach (byte b in lengthOctets)
             {
                 contentLength = (contentLength << 8) | b;
             }
         }
 
-        if (contentLength < 0 || headerLength + contentLength > MaxTokenBytes)
+        if (contentLength < 0 || (long)headerLength + contentLength > MaxTokenBytes)
         {
             throw new NtlmAuthenticationException(
-                $"SPNEGO token declares an implausible length of {contentLength} bytes");
+                $"CredSSP request declares an implausible length of {contentLength} bytes");
         }
 
-        byte[] content = await ReadExactAsync(channel, contentLength, cancellationToken).ConfigureAwait(false);
-        byte[] token = new byte[headerLength + contentLength];
-        prefix.CopyTo(token, 0);
-        if (headerLength > 2)
-        {
-            // Re-read is unnecessary: the length octets were consumed above.
-        }
+        byte[] content = await ReadExactAsync(channel, contentLength, cancellationToken)
+            .ConfigureAwait(false);
 
-        content.CopyTo(token, headerLength);
-        return token;
+        var der = new byte[headerLength + contentLength];
+        prefix.CopyTo(der, 0);
+        lengthOctets.CopyTo(der, 2);
+        content.CopyTo(der.AsSpan(headerLength));
+
+        return CredSsp.ParseRequest(der);
     }
 
     private static async Task<byte[]> ReadExactAsync(Stream stream, int count, CancellationToken cancellationToken)

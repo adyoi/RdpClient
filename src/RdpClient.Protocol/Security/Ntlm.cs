@@ -322,4 +322,31 @@ public static class Ntlm
         pairs.AddRange([0x00, 0x00]);                                         // MsvAvEOL
         return [.. pairs];
     }
+
+    /// <summary>
+    /// Name an NTLM message for logging, given its message type.
+    /// </summary>
+    /// <remarks>
+    /// A token too short to hold the 32-bit type at offset 8 is reported as
+    /// such rather than throwing: this is a diagnostic, and a malformed token is
+    /// exactly the case where the caller wants a name rather than an exception.
+    /// </remarks>
+    public static string DescribeType(byte[] message)
+    {
+        ArgumentNullException.ThrowIfNull(message);
+
+        if (message.Length < 12 || !message.AsSpan(0, 8).SequenceEqual(Signature))
+        {
+            return "not an NTLM message";
+        }
+
+        uint type = BitConverter.ToUInt32(message, 8);
+        return type switch
+        {
+            NtlmMessageType.Negotiate => "NEGOTIATE",
+            NtlmMessageType.Challenge => "CHALLENGE",
+            NtlmMessageType.Authenticate => "AUTHENTICATE",
+            _ => $"type {type}",
+        };
+    }
 }

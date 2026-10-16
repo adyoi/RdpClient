@@ -32,7 +32,8 @@ exists for IntelliSense; everything non-obvious is documented at the member.
 | X.224 / T.125 connection request | 2.2.1.1 | Verified against a live host |
 | RDP negotiation | 2.2.1.1.1, 2.2.1.2.1 | Verified |
 | TLS handshake | MS-RDPEA 3.1.5.1 | Verified, TLS 1.2 and 1.3 |
-| SPNEGO + NTLM | MS-NLMP | **Not working**, host resets after the token |
+| CredSSP `TSRequest` envelope | MS-CSSP 2.2.1 | **Encoded and verified structurally**; host now parses it |
+| SPNEGO + NTLM | MS-NLMP | **Not working**, host returns `SEC_E_INVALID_TOKEN` |
 | MCS Connect Initial / Response | 2.2.1.3.4, 2.2.1.3.5 | Written, unreachable |
 | RSA key exchange, session keys, MCS encryption | 5.3.2 | Not started |
 | Capability exchange | 2.2.7 | Not started |
@@ -40,6 +41,32 @@ exists for IntelliSense; everything non-obvious is documented at the member.
 
 Do not describe this as a working remote desktop client. It reaches TLS and
 authenticates nothing.
+
+## Ask the server what it thinks
+
+Schannel reports a CredSSP rejection as a TLS error, which is useless:
+
+> The decryption operation failed ... The Local Security Authority cannot be
+> contacted
+
+That message means the peer closed the socket. The real reason is in the server's
+event log, and it names the exact failure:
+
+```powershell
+Get-WinEvent -LogName "Microsoft-Windows-RemoteDesktopServices-RdpCoreTS/Operational" -MaxEvents 20 |
+  Where-Object Id -in 139,226,102 | Sort-Object TimeCreated |
+  ForEach-Object { "{0:HH:mm:ss.fff} id={1} {2}" -f $_.TimeCreated, $_.Id,
+                   ($_.Message -replace "\s+"," ").Trim() }
+```
+
+Event 139 carries the NTSTATUS, for example
+`The server security layer detected an error (0x80090308) in the protocol stream`.
+`0x80090308` is `SEC_E_INVALID_TOKEN`, which in the `msv1_0.dll` validator is what
+NTLM returns when a message fails its signature, type or size check.
+
+Use this before forming a theory. It distinguishes "the peer never understood me"
+from "the peer understood me and rejected one specific field", which look
+identical from the client side.
 
 ## Wire-format invariants
 
@@ -113,8 +140,18 @@ Which binary to open matters. Windows splits the RDP stack:
 | --- | --- |
 | RDP client shell | `mstsc.exe` (1.1 MB, no dialogs; a thin host) |
 | RDP client logic, ActiveX control | `mstscax.dll` (8.7 MB, 22,685 functions) |
+| **CredSSP / TSRequest envelope** | **`credssp.dll` (53 KB, "Microsoft CredSSP Security Provider")** |
 | **NTLM implementation** | `msv1_0.dll` (608 KB) |
 | Kerberos / NegoEx | `secur32.dll` (53 KB, contains no NTLM) |
+
+`credssp.dll` is the binary that matters for CredSSP. Its exports are the
+`Sp*` set (`SpInitializeSecurityContextW` and so on) and its string table
+contains `Negotiate`, which is the SSPI package it negotiates *through* - so the
+token in `negoToken` is SPNEGO, not a bare NTLM message.
+
+`SpInitializeSecurityContextW` copies the underlying package's output buffer
+straight into the serializer, and `FUN_180003cd8` in that DLL is the routine
+that assembles the final `TSRequest`.
 
 ## When authentication fails, reach for the decompiler
 
@@ -127,8 +164,27 @@ Ghidra will read them:
   the same binary or from `secur32.dll`'s NegoEx path.
 
 Seven hypotheses about the SPNEGO token were tested and eliminated in this
-repository's history. The current one is still open. Inspecting `msv1_0.dll` is
-the next step, not a seventh guess.
+repository's history. The eighth turned out to be a missing layer rather than a
+malformed one: **the client was sending a bare SPNEGO token with no CredSSP
+`TSRequest` envelope at all.** That is fixed and pinned by `CredSspTests`.
+
+The host now reports `0x80090308` instead of resetting silently, which means it
+parses the envelope and rejects the token *inside* it. Both a bare NTLM message
+and the SPNEGO-wrapped one produce the same status, so the remaining defect is
+inside the SPNEGO or NTLM content, not the envelope.
+
+### Open question: the NTLM flag values
+
+`Ntlm.ClientFlags` encodes to `0xE2088207`, which is self-consistent, but several
+members of `NtlmFlags` were found not to match the MS-NLMP 2.2.2.5 table
+(`NegotiateNtlm` is declared `0x00000200`, which is the bit the specification
+assigns to `NEGOTIATE_OEM_WORKSTATION_SUPPLIED`). The 2021 revision of the
+specification PDF expresses flags as bit positions rather than hex, so the
+authoritative mapping has not been transcribed yet.
+
+**Do not "fix" these values from memory.** They were already corrected once, in
+`e33c005`, and a second guess would be a regression dressed as progress. Read
+the bit-to-value mapping out of the specification first, then change them.
 
 ## Conventions
 
