@@ -50,11 +50,19 @@ found by diffing against a working reference implementation.
 Nothing is known broken in the protocol path. **NTLM authentication now
 completes**: the server accepts the AUTHENTICATE and answers
 `STATUS_LOGON_FAILURE` (`0xC000006D`) instead of `SEC_E_INVALID_TOKEN`
-(`0x80090308`), which is the correct answer for a wrong password. The CredSSP
-exchange works end to end and only the credential is outstanding;
-`rdpprobe` reads it from `RDP_PASSWORD`.
+(`0x80090308`). The CredSSP exchange works end to end.
 
-- The AUTHENTICATE now carries what `NEGOTIATE_KEY_EXCHANGE` requires
+- **MD4 was wrong in three separate ways**, and a wrong NT hash makes *every*
+  password fail with `STATUS_LOGON_FAILURE`, which is indistinguishable from a
+  wrong password at the protocol level. It had a leftover register shuffle from
+  a different formulation of the round step, four rounds of sixteen operations
+  where RFC 1320 has three, and neither of the additive constants
+  `0x5A827999` and `0x6ED9EBA1`. Each defect on its own still produced a
+  plausible-looking 128-bit digest.
+- The NTLMv2 response now uses the server's `MsvAvTimestamp` when the challenge
+  carries one (MS-NLMP 3.2.2.2.1) and converts to a FILETIME otherwise, rather
+  than writing `DateTime.Ticks`, which counts from year 1 rather than 1601.
+- The AUTHENTICATE carries what `NEGOTIATE_KEY_EXCHANGE` requires
   (MS-NLMP 3.1.5.1.2, 3.4.4): a 16-byte random session key, its RC4-wrapped
   `EncryptedRandomSessionKey`, and a message integrity code over all three
   messages.
@@ -65,6 +73,11 @@ Two details were wrong at first and are recorded because both produce a
 plausible message rather than an error: the MIC is keyed with the *session key*,
 not the session base key, and `EncryptedRandomSessionKey` is
 `RC4(SessionBaseKey, SessionKey)` and is not optional.
+
+**Lesson worth keeping:** MD4 has no security value and is here only because
+MS-NLMP names it, which is exactly why it sat untested for so long. Anything
+implemented to satisfy a specification, rather than to be used, needs a
+known-answer test or it will quietly be wrong.
 
 ### Settled
 

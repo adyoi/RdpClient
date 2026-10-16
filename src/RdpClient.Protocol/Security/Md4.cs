@@ -90,25 +90,25 @@ public sealed class Md4 : IDisposable
 
         uint a = _state[0], b = _state[1], c = _state[2], d = _state[3];
 
-        Round(ref a, ref b, ref c, ref d, 0, 3, 1);
-        Round(ref d, ref a, ref b, ref c, 1, 7, 2);
-        Round(ref c, ref d, ref a, ref b, 2, 11, 3);
-        Round(ref b, ref c, ref d, ref a, 3, 19, 4);
-
-        Round(ref a, ref b, ref c, ref d, 4, 3, 5);
-        Round(ref d, ref a, ref b, ref c, 5, 7, 6);
-        Round(ref c, ref d, ref a, ref b, 6, 11, 7);
-        Round(ref b, ref c, ref d, ref a, 7, 19, 8);
-
-        Round(ref a, ref b, ref c, ref d, 8, 3, 9);
-        Round(ref d, ref a, ref b, ref c, 9, 7, 10);
-        Round(ref c, ref d, ref a, ref b, 10, 11, 11);
-        Round(ref b, ref c, ref d, ref a, 11, 19, 12);
-
-        Round(ref a, ref b, ref c, ref d, 12, 3, 13);
-        Round(ref d, ref a, ref b, ref c, 13, 7, 14);
-        Round(ref c, ref d, ref a, ref b, 14, 11, 15);
-        Round(ref b, ref c, ref d, ref a, 15, 19, 16);
+        // RFC 1320 section 3.2: three rounds of sixteen operations. Each round
+        // has its own mixing function, its own additive constant and its own
+        // walk over the message words, so all three are tabulated from the RFC
+        // rather than derived. Getting this wrong still yields a
+        // plausible-looking 128-bit digest; only a known-answer test catches
+        // it, which is why MD4 carries RFC 1320 Appendix A.5 vectors.
+        //
+        // The four registers rotate after each operation so the one to update
+        // is always first: v becomes [v3, v0, v1, v2]. That turns the RFC's
+        // ABCD/DABC/CDAB/BCDA ordering into a straight loop.
+        foreach ((Func<uint, uint, uint, uint> mix, uint constant, byte[] order, byte[] rotations)
+                 in Rounds)
+        {
+            for (int i = 0; i < 16; i++)
+            {
+                uint next = RotateLeft(a + mix(b, c, d) + _x[order[i]] + constant, rotations[i & 3]);
+                (a, b, c, d) = (d, next, b, c);
+            }
+        }
 
         _state[0] += a;
         _state[1] += b;
@@ -116,34 +116,23 @@ public sealed class Md4 : IDisposable
         _state[3] += d;
     }
 
-    private void Round(ref uint a, ref uint b, ref uint c, ref uint d, int k, int s, int round)
-    {
-        uint f;
-        int g;
+    private static uint F(uint x, uint y, uint z) => (x & y) | (~x & z);
 
-        switch (round)
-        {
-            case 1:
-            case 2:
-                f = (b & c) | (~b & d);
-                g = k;
-                break;
-            case 3:
-                f = (b & c) | (b & d) | (c & d);
-                g = (5 * k + 1) % 16;
-                break;
-            default:
-                f = b ^ c ^ d;
-                g = (3 * k + 5) % 16;
-                break;
-        }
+    private static uint G(uint x, uint y, uint z) => (x & y) | (x & z) | (y & z);
 
-        uint temp = a + f + _x[g];
-        a = d;
-        d = c;
-        c = b;
-        b = RotateLeft(temp, s);
-    }
+    private static uint H(uint x, uint y, uint z) => x ^ y ^ z;
+
+    /// <summary>
+    /// RFC 1320 section 3.2, transcribed: mixing function, additive constant,
+    /// the order the message words are visited in, and the rotation amounts.
+    /// </summary>
+    private static readonly (Func<uint, uint, uint, uint> Mix, uint Constant, byte[] Order, byte[] Rotations)[]
+        Rounds =
+        [
+            (F, 0x00000000, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], [3, 7, 11, 19]),
+            (G, 0x5A827999, [0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15], [3, 5, 9, 13]),
+            (H, 0x6ED9EBA1, [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15], [3, 9, 11, 15]),
+        ];
 
     private static uint RotateLeft(uint value, int count) =>
         (value << count) | (value >> (32 - count));

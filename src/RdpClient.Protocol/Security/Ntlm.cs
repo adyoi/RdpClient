@@ -392,28 +392,68 @@ public static class Ntlm
         byte[] identity = Encoding.Unicode.GetBytes(userName.ToUpperInvariant() + domain);
         byte[] ntowfv2 = HMACMD5.HashData(ntHash, identity);
 
-        var temp = new List<byte>(64 + targetInfo.Length)
+        var temp = new List<byte>(80 + targetInfo.Length)
         {
             0x01,                          // Responserversion
             0x01,                          // HiResponserversion
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Z(6)
         };
-        temp.AddRange(BitConverter.GetBytes(DateTime.UtcNow.Ticks)); // FILETIME, 8 bytes
+
+        // MS-NLMP 3.2.2.2.1: when TargetInfo carries an MsvAvTimestamp the client
+        // uses that value, and only falls back to the local clock otherwise.
+        temp.AddRange(ReadTimestamp(targetInfo));
         temp.AddRange(clientChallenge[..8]);
         temp.AddRange([0x00, 0x00, 0x00, 0x00]);                       // Z(4)
         temp.AddRange(targetInfo);
         temp.AddRange([0x00, 0x00, 0x00, 0x00]);                       // Z(4)
 
-        // NTProofStr = HMAC-MD5(NTOWFv2, server challenge || temp)
+        // NTProofStr = HMAC-MD5(NTOWFv2, ServerChallenge || temp)
         var proofInput = new byte[serverChallenge.Length + temp.Count];
         serverChallenge.CopyTo(proofInput);
         temp.CopyTo(proofInput.AsSpan(serverChallenge.Length));
         byte[] proof = HMACMD5.HashData(ntowfv2, proofInput);
 
+        // The trailing ServerChallenge and Reserved octets are part of the
+        // structure in MS-NLMP 3.2.5.1.2 but are not part of the HMAC input, and
+        // the reference implementation omits them. Whether a server tolerates
+        // them is not something to guess at, so this follows the reference.
         var response = new byte[proof.Length + temp.Count];
         proof.CopyTo(response, 0);
-        temp.CopyTo(response, proof.Length);
+        temp.CopyTo(response.AsSpan(proof.Length));
         return response;
+    }
+
+    /// <summary>
+    /// The 8-octet timestamp for an NTLMv2 response (MS-NLMP 3.2.2.2.1).
+    /// </summary>
+    /// <remarks>
+    /// Prefers <c>MsvAvTimestamp</c> from the server's TargetInfo. Falling back
+    /// means converting to a FILETIME: 100-nanosecond intervals since
+    /// 1601-01-01, not since 0001-01-01 as <see cref="DateTime.Ticks"/> counts.
+    /// </remarks>
+    private static byte[] ReadTimestamp(ReadOnlySpan<byte> targetInfo)
+    {
+        int cursor = 0;
+        while (cursor + 4 <= targetInfo.Length)
+        {
+            var id = BinaryPrimitivesCompat.ReadUInt16LittleEndian(targetInfo[cursor..]);
+            var length = BinaryPrimitivesCompat.ReadUInt16LittleEndian(targetInfo[(cursor + 2)..]);
+
+            if (id == (ushort)NtlmAvPair.Eol)
+            {
+                break;
+            }
+
+            if (id == (ushort)NtlmAvPair.Timestamp && length >= 8 && cursor + 12 <= targetInfo.Length)
+            {
+                return targetInfo.Slice(cursor + 4, 8).ToArray();
+            }
+
+            cursor += 4 + length;
+        }
+
+        const long FileTimeEpochTicks = 504911232000000000;
+        return BitConverter.GetBytes(DateTime.UtcNow.Ticks - FileTimeEpochTicks);
     }
 
     /// <summary>Build a minimal TargetInfo blob when the server sent none.</summary>
