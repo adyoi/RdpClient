@@ -86,14 +86,19 @@ confirm rejection, never acceptance.
 ### Settled
 
 `NtlmFlags` values were suspected and cleared: MS-NLMP 2.2.2.5 labels the bits
-(`W`=56-bit at 31, `H`=NTLM at 9, `L`=OEM workstation at 13) and every declared
-value matches.
+(`W`=56-bit at 31, `H`=NTLM at 9, `L`=OEM workstation at 13) and every
+declared value matches.
 
-SPNEGO wrapping was suspected and cleared. sspi's own documentation on
-`ClientMode` states it directly: *"mstsc and other RDP clients send plain NTLM
-messages (without SPNEGO wrappers) inside CredSSP when Kerberos is not
-possible."* Its reference `TSRequest` test vector begins with a bare `NTLMSSP`
-signature inside `negoToken`, confirming it.
+### Removed
+
+- `Spnego.cs`. CredSSP does not wrap NTLM in SPNEGO, so the encoder had no
+  callers and was worse than unused: its doc comment described exactly the
+  layering the protocol does *not* use, which invited a future reader to
+  "correct" the authenticator by using it. sspi's documentation on `ClientMode`
+  is explicit - *"mstsc and other RDP clients send plain NTLM messages (without
+  SPNEGO wrappers) inside CredSSP when Kerberos is not possible"* - and its
+  reference `TSRequest` vector begins with a bare `NTLMSSP` signature inside
+  `negoToken`.
 
 ### Investigation
 
