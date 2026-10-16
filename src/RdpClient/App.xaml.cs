@@ -4,6 +4,7 @@ using Microsoft.UI.Xaml.Data;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Navigation;
+using RdpClient.Protocol;
 
 // To learn more about WinUI, the WinUI project structure,
 // and more about our project templates, see: http://aka.ms/winui-project-info.
@@ -50,7 +51,17 @@ public partial class App : Application
     /// <param name="args">Details about the launch request and process.</param>
     protected override void OnLaunched(Microsoft.UI.Xaml.LaunchActivatedEventArgs args)
     {
-        Window = new MainWindow();
+        // Command-line arguments pre-fill the form so a run can be scripted and
+        // repeated. They are parsed before the window is built, because the page
+        // reads them in its constructor; a bad argument is reported into the
+        // connection log rather than shown in a dialog, so a scripted run does
+        // not block on a window nobody is watching.
+        string[] arguments = (args.Arguments ?? string.Empty)
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        ConnectionArguments parsed = ConnectionArguments.Parse(arguments);
+
+        Window = new MainWindow(parsed);
         DispatcherQueue = Microsoft.UI.Dispatching.DispatcherQueue.GetForCurrentThread();
         Window.Activate();
     }
