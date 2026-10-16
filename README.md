@@ -71,8 +71,9 @@ verified against a live server. Everything after channel join is not.
 | Keyboard and pointer input | 2.2.8 | Not started |
 | Virtual channel data (clipboard, drive, audio) | 2.2.6 | Not started |
 
-A server will complete the handshake and then wait. The app says so explicitly rather than
-hanging or pretending.
+A modern host negotiates successfully and then selects CredSSP, so the client
+stops there and says why. It does not send an MCS Connect Initial it knows the
+server will reject.
 
 ## Platform support
 
@@ -124,15 +125,28 @@ without the GUI:
 dotnet run --project src/RdpClient.Cli -- --host 192.0.2.10 --port 3389
 ```
 
+Actual output against a Windows host with NLA enabled:
+
 ```text
-14:22:07.318  info    connecting to 192.0.2.10:3389...
-14:22:07.402  info    TCP established to 192.0.2.10:3389
-14:22:07.404  info    sent X.224 Connection Request (19 bytes)
-14:22:07.451  info    negotiated version 0x00080005, SelectedProtocol 0x00000001; correlation echoed correctly
-14:22:07.452  info    sent MCS Connect Initial (295 bytes)
-14:22:07.601  info    MCS accepted (conference 0), UserID 1001, token 0x0547
-14:22:08.102  info    joined MCS global channel 1007
+RdpClient protocol probe -> 127.0.0.1:3389
+protocol core: RdpClient.Protocol 1.0.0.0
+
+07:12:02.589  info    resolving 127.0.0.1...
+07:12:02.612  info    connecting to 127.0.0.1:3389...
+07:12:02.622  info    TCP established to 127.0.0.1:3389
+07:12:02.624  info    sent X.224 Connection Request (43 bytes)
+07:12:02.632  info    negotiated version 0x00000008, SelectedProtocol 0x00000008; correlation NOT echoed
+07:12:02.632  error   server selected HYBRID_EX, which requires the CredSSP/NLA handshake
+                      (TLS + SPNEGO + NTLM). That handshake is not implemented, so the
+                      MCS layer cannot start.
+
+RESULT: failed - server selected HYBRID_EX, ...
 ```
+
+**That stop is the honest current state.** Negotiation completes and is verified
+against a real host; the run then ends because a modern host selects CredSSP. Add
+`--hex` to dump transmitted PDUs, or `--no-correlation` to send the minimal
+19-byte request.
 
 The harness never prints the password, and reads it from `RDP_PASSWORD` when one is needed.
 
@@ -141,14 +155,16 @@ The harness never prints the password, and reads it from `RDP_PASSWORD` when one
 ```text
 src/
   RdpClient.Protocol/   Protocol core. No UI dependency, plain .NET.
-    ByteCodec.cs          Little-endian reader/writer with RDP alignment rules
+    ByteCodec.cs          Little-endian reader/writer; the TPKT length is big-endian
     Rdp.cs                Constants transcribed from MS-RDPBCGR
     Negotiation.cs        X.224 / T.125 and RDP_NEG_REQ / RDP_NEG_RSP
     Mcs.cs                Connect Initial/Response, Erect Domain, Attach User, join
     ClientPdu.cs          TS_UD_CS_CORE / SECURITY / NET / CLUSTER / USER
     RdpConnection.cs      Connection sequencing over TCP
-  RdpClient.App/        WinUI 3 front end (Windows only)
+  RdpClient/            WinUI 3 front end (Windows only)
   RdpClient.Cli/        Console handshake harness
+tests/
+  RdpClient.Protocol.Tests/
 docs/                   Protocol notes, research, architecture
 ```
 
