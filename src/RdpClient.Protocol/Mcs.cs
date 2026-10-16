@@ -18,54 +18,122 @@ public static class Mcs
     /// The conference name length is expressed in UTF-16 code units, not bytes,
     /// which is the detail most reimplementations get wrong.
     /// </remarks>
-    public static byte[] BuildConferenceCreateRequest(string conferenceName = Rdp.GccConferenceName)
+    public static byte[] BuildConferenceCreateRequest(
+        byte[] clientData,
+        string conferenceName = Rdp.McsConferenceName)
     {
-        var w = new ByteWriter(64);
-        w.U8(0x01); // t124 Identifier
-        w.U16(conferenceName.Length);
-        w.Utf16(conferenceName);
-        w.U16(Rdp.GccConferenceLabel);
+        ArgumentNullException.ThrowIfNull(clientData);
+        ArgumentNullException.ThrowIfNull(conferenceName);
+
+        var w = new ByteWriter(clientData.Length + 32);
+
+        // From Key: select the OBJECT_IDENTIFIER alternative.
+        w.U8(0x00);
+
+        // ITU-T T.124 (02/98): five octets, the first two combined as 0*40+0.
+        w.U8(0x05);
+        w.U8(0x00);
+        w.U8(0x14);
+        w.U8(0x7C);
+        w.U8(0x00);
+        w.U8(0x01);
+
+        // connectPDU length: everything after this field, which is the client
+        // data plus fourteen octets of framing.
+        const int ConnectPduOverhead = 14;
+        Asn1.WritePerLength(w, clientData.Length + ConnectPduOverhead);
+
+        // ConnectGCCPDU: conferenceCreateRequest, then its optional userData.
+        w.U8(0x00);
+        w.U8(0x08);
+
+        // The name is a numeric string here: digit pairs packed one per octet,
+        // so "1" is 0x10 rather than 0x01.
+        Asn1.WritePerNumericString(w, conferenceName, minimum: 1);
+        w.U8(0x00);            // padding to the next octet boundary
+        w.U8(0x01);            // one set of user data follows
+
+        // UserData: value present, h221NonStandard selected. The Duca key marks
+        // the block as the client-to-server H.221 extension; a server that does
+        // not know it ignores the block instead of refusing the connection.
+        w.U8(0xC0);
+        Asn1.WritePerOctetString(w, "Duca"u8.ToArray(), minimum: 4);
+
+        Asn1.WritePerOctetString(w, clientData, minimum: 0);
         return w.ToArray();
     }
 
     public sealed record ConnectInitialOptions
     {
-        public uint Cookie { get; init; } = 0xa0a0;
-        public byte ProtocolVersion { get; init; } = 3;
-        public ushort RSTransactionId { get; init; }
-        public ushort ClientNodeId { get; init; } = Rdp.McsUserChannelBase;
-
         /// <summary>TS_UD_CS_CORE, TS_UD_CS_SECURITY, TS_UD_CS_NET and friends, concatenated.</summary>
         public required byte[] ClientInfo { get; init; }
 
-        public string ConferenceName { get; init; } = Rdp.GccConferenceName;
+        public string ConferenceName { get; init; } = "1";
+
+        public McsDomainParameters TargetParameters { get; init; } = McsDomainParameters.Target;
+        public McsDomainParameters MinimumParameters { get; init; } = McsDomainParameters.Minimum;
+        public McsDomainParameters MaximumParameters { get; init; } = McsDomainParameters.Maximum;
     }
 
     /// <summary>
-    /// Build the MCS Connect Initial PDU carrying the GCC conference and client data.
+    /// Build the T.125 Connect-Initial (MS-RDPBCGR 2.2.1.3.4.1).
     /// </summary>
     /// <remarks>
-    /// Each variable-length region is prefixed with a 2-byte byte count, and the
-    /// whole thing is wrapped in TPKT/X.224 by <see cref="Negotiation.Tpkt"/>.
+    /// <para>
+    /// This is an ASN.1 structure, not the flat TLV it is often described as:
+    /// <c>Connect-Initial ::= [APPLICATION 101] IMPLICIT SEQUENCE</c> holding two
+    /// domain selectors, an upward flag, three sets of domain parameters, and the
+    /// user data. The tag goes out as <c>7f 65</c>, because 101 does not fit the
+    /// five tag bits in one octet.
+    /// </para>
+    /// <para>
+    /// Getting this wrong is silent in one direction and loud in the other: a
+    /// server that names the structure it expected makes the mistake obvious,
+    /// which is why the identifier is worth matching exactly.
+    /// </para>
     /// </remarks>
     public static byte[] BuildConnectInitial(ConnectInitialOptions options)
     {
-        byte[] conference = BuildConferenceCreateRequest(options.ConferenceName);
+        ArgumentNullException.ThrowIfNull(options);
 
-        var mcs = new ByteWriter(256);
-        mcs.U8(options.ProtocolVersion);
-        mcs.U16(options.RSTransactionId);
-        mcs.U16((int)options.Cookie);
+        byte[] gcc = BuildConferenceCreateRequest(options.ClientInfo, options.ConferenceName);
 
-        // Connect Data: length-prefixed GCC Conference Create Request.
-        mcs.U16(conference.Length).Bytes(conference);
+        var body = new ByteWriter(gcc.Length + 96);
 
-        // Client Node ID: length-prefixed.
-        mcs.U16(2).U16(options.ClientNodeId);
+        // Both selectors are the single octet 0x01: the T.125 "domain" this
+        // client belongs to.
+        body.Bytes(Asn1.BerOctetString([0x01]));
+        body.Bytes(Asn1.BerOctetString([0x01]));
 
-        // Client Info: length-prefixed block of TS_UD_CS_* structures.
-        mcs.U16(options.ClientInfo.Length).Bytes(options.ClientInfo);
-        return mcs.ToArray();
+        // upwardFlag TRUE: the client is joining, not creating a domain.
+        body.Bytes(Asn1.BerBoolean(true));
+
+        body.Bytes(BerDomainParameters(options.TargetParameters));
+        body.Bytes(BerDomainParameters(options.MinimumParameters));
+        body.Bytes(BerDomainParameters(options.MaximumParameters));
+
+        // userData: the GCC Conference Create Request carrying the TS_UD_CS_*
+        // client blocks.
+        body.Bytes(Asn1.BerOctetString(gcc));
+
+        return Asn1.WrapApplication(Asn1.ConnectInitialTag, body.ToArray());
+    }
+
+    private static byte[] BerDomainParameters(McsDomainParameters parameters)
+    {
+        ArgumentNullException.ThrowIfNull(parameters);
+
+        var body = new ByteWriter(64);
+        body.Bytes(Asn1.BerInteger(parameters.MaxChannelIds));
+        body.Bytes(Asn1.BerInteger(parameters.MaxUserIds));
+        body.Bytes(Asn1.BerInteger(parameters.MaxTokenIds));
+        body.Bytes(Asn1.BerInteger(parameters.NumPriorities));
+        body.Bytes(Asn1.BerInteger(parameters.MinThroughput));
+        body.Bytes(Asn1.BerInteger(parameters.MaxHeight));
+        body.Bytes(Asn1.BerInteger(parameters.MaxMcsPduSize));
+        body.Bytes(Asn1.BerInteger(parameters.ProtocolVersion));
+
+        return Asn1.BerSequence(body.ToArray());
     }
 
     /// <summary>
@@ -116,19 +184,53 @@ public static class Mcs
     {
         var r = new ByteReader(buffer);
 
-        // Tolerate an X.224 wrapper: a leading 0xF0 data TPDU followed by a
-        // 2-byte length indicator.
-        int offset = 0;
-        if (r.Remaining > 2 && r.PeekRest()[0] == Rdp.X224Data)
+        // The reader is handed the whole TPKT datagram. Starting at offset 0
+        // reads the TPKT version as if it were the MCS result, which is how a
+        // 0x03 here became "connection refused" from a server that had
+        // accepted the connection.
+        r.Skip(4);
+
+        // Then the X.224 Data TPDU, which is length indicator, DT code, EOT.
+        // The code is the second octet; the first is the length indicator and
+        // comparing that against the DT code never matches.
+        ReadOnlySpan<byte> framed = r.PeekRest();
+        if (framed.Length >= 3 && framed[1] == Rdp.X224Data)
         {
-            r.Skip(1);
-            int li = r.U8();
-            r.Skip(li); // li counts itself plus the EOFI/consumed bytes
-            offset = r.Offset;
+            r.Skip(3);
         }
 
-        r.Seek(offset);
-        byte result = r.U8();
+        ReadOnlySpan<byte> payload = r.PeekRest();
+
+        // Connect-Response ::= [APPLICATION 102] IMPLICIT SEQUENCE, so the
+        // identifier is 7f 66. Reading the first payload octet as the result
+        // instead reads the tag, and reports a refusal the server never made.
+        if (!Asn1.TryReadHeader(payload, out byte tag, out int length, out int headerSize)
+            || tag != Asn1.ConnectResponseTag)
+        {
+            // Naming the octets the response actually began with is what makes
+            // this diagnosable; the identifier alone rarely is.
+            int shown = Math.Min(payload.Length, 12);
+            string seen = Convert.ToHexString(payload[..shown]).ToLowerInvariant();
+
+            return new ConnectResponse(
+                false, 0, null, null, null, null, null, null,
+                $"not a Connect-Response structure: identifier {tag:x4}, wanted "
+                + $"{Asn1.ConnectResponseTag:x4}; the PDU begins {seen}",
+                buffer);
+        }
+
+        ReadOnlySpan<byte> body = payload.Slice(headerSize, length);
+
+        // result ENUMERATED, then calledConnectId, domainParameters, userData.
+        if (!Asn1.TryReadHeader(body, out byte resultTag, out int resultLength, out int resultHeader)
+            || resultTag != Asn1.Enumerated || resultLength < 1)
+        {
+            return new ConnectResponse(
+                false, 0, null, null, null, null, null, null,
+                "the Connect-Response carries no result", buffer);
+        }
+
+        byte result = body[resultHeader];
 
         if (result != 0)
         {
@@ -137,69 +239,134 @@ public static class Mcs
                 $"MCS Connect Response result {result}: connection refused", buffer);
         }
 
-        if (r.Remaining < 2)
+        // The user id the client attaches itself with lives in the conference
+        // response inside userData, not in the calledConnectId. The two
+        // fields between them are skipped by walking their BER headers.
+        ReadOnlySpan<byte> rest = body[(resultHeader + resultLength)..];
+        if (!TryReachUserData(rest, out ReadOnlySpan<byte> userData, out string walkProblem))
         {
             return new ConnectResponse(
-                true, result, null, null, null, null, null, null,
-                "MCS Connect Response accepted but carried no Connect Data", buffer);
+                true, result, 0, null, null, null, null, null,
+                $"MCS accepted but its fields were unreadable: {walkProblem}", buffer);
         }
 
-        int connectDataLength = r.U16();
-        r.Seek(r.Offset + connectDataLength);
-        if (r.Remaining < 1)
+        if (!TryParseConferenceResponse(userData, out ushort userId, out ushort? nodeId, out string problem))
         {
             return new ConnectResponse(
-                true, result, null, null, null, null, null, null,
-                "MCS Connect Response accepted; Connect Data empty", buffer);
+                true, result, 0, null, null, null, null, null,
+                $"MCS accepted but the conference response was unreadable: {problem}", buffer);
         }
 
-        byte t124 = r.U8();
-        int t124Length = r.U8();
-        r.Skip(2); // t124 identifier padding
-        if (r.Remaining < 6)
+        string summary = $"MCS accepted (conference 0), UserID {userId}";
+        if (nodeId is not null)
         {
-            return new ConnectResponse(
-                true, result, null, null, null, null, null, null,
-                $"MCS accepted; T.124 identifier {t124}, Connect Data too short", buffer);
+            summary += $", ServerNodeID {nodeId}";
         }
-
-        byte conferenceResult = r.U8();
-        ushort userId = r.U16();
-        ushort token = r.U16();
-
-        ushort? serverNodeId = null;
-        ushort? serverNonce = null;
-        ushort? labelId = null;
-
-        // The trailing three variable fields are present on a successful
-        // conference create; a failed one stops after the fixed header.
-        if (conferenceResult == 0 && r.Remaining >= 2)
-        {
-            int len = r.U16();
-            if (len == 2 && r.Remaining >= 2) { serverNodeId = r.U16(); }
-        }
-
-        if (conferenceResult == 0 && r.Remaining >= 2)
-        {
-            int len = r.U16();
-            if (len == 2 && r.Remaining >= 2) { serverNonce = r.U16(); }
-        }
-
-        if (conferenceResult == 0 && r.Remaining >= 2)
-        {
-            int len = r.U16();
-            if (len == 2 && r.Remaining >= 2) { labelId = r.U16(); }
-        }
-
-        string summary =
-            $"MCS accepted (conference {conferenceResult}), UserID {userId}, token 0x{token:x4}";
-        if (serverNodeId is not null) summary += $", ServerNodeID {serverNodeId}";
-        if (serverNonce is not null) summary += $", ServerNonce {serverNonce}";
-        if (labelId is not null) summary += $", LabelID {labelId}";
 
         return new ConnectResponse(
-            conferenceResult == 0, result, conferenceResult, userId, token,
-            serverNodeId, serverNonce, labelId, summary, buffer);
+            true, result, 0, userId, userId, nodeId, null, userId, summary, buffer);
+    }
+
+    /// <summary>
+    /// Step over calledConnectId and domainParameters to reach userData.
+    /// </summary>
+    /// <remarks>
+    /// The order is fixed by T.125, so walking two BER headers is enough; the
+    /// payload of each is skipped whole, which is what makes this independent
+    /// of how many domain parameters a server chooses to send.
+    /// </remarks>
+    private static bool TryReachUserData(
+        ReadOnlySpan<byte> data,
+        out ReadOnlySpan<byte> userData,
+        out string problem)
+    {
+        userData = default;
+        problem = string.Empty;
+
+        ReadOnlySpan<byte> rest = data;
+        foreach (byte expected in new[] { Asn1.Integer, Asn1.Sequence, Asn1.OctetString })
+        {
+            if (!Asn1.TryReadHeader(rest, out byte tag, out int length, out int headerSize)
+                || tag != expected)
+            {
+                problem = $"expected tag {expected:x2}, found {(tag):x2}";
+                return false;
+            }
+
+            if (expected == Asn1.OctetString)
+            {
+                userData = rest.Slice(headerSize, length);
+                return true;
+            }
+
+            rest = rest[(headerSize + length)..];
+        }
+
+        problem = "userData did not appear";
+        return false;
+    }
+
+    /// <summary>
+    /// Read the GCC Conference Create Response inside the Connect-Response's
+    /// user data (MS-RDPBCGR 2.2.1.3.3).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The body is PER-encoded. One field is deliberately not trusted: the
+    /// connectPDU length, which MS-RDPBCGR says the client must ignore, because
+    /// servers do not agree on what it counts. Stepping over it as a
+    /// variable-width field rather than a length is what makes the rest line
+    /// up.
+    /// </para>
+    /// <para>
+    /// The user id is a PER integer relative to the lowest id in use, so it
+    /// arrives big-endian with no length prefix and 1001 has to be added back.
+    /// </para>
+    /// </remarks>
+    private static bool TryParseConferenceResponse(
+        ReadOnlySpan<byte> data,
+        out ushort userId,
+        out ushort? nodeId,
+        out string problem)
+    {
+        userId = 0;
+        nodeId = null;
+        problem = string.Empty;
+
+        ReadOnlySpan<byte> g = data;
+
+        // From Key choice (1), then the T.124 object identifier (a one-octet
+        // length followed by five octets, so six in total), then the connectPDU
+        // length that must be ignored. Counting the identifier as five octets
+        // leaves the cursor one short and reads the user id from the wrong
+        // place.
+        int cursor = 1 + 6;
+        if (g.Length < cursor + 1)
+        {
+            problem = "truncated before the connectPDU length";
+            return false;
+        }
+
+        cursor++;                                          // the ignored length
+        if (g.Length < cursor + 1)
+        {
+            problem = "truncated before the ConnectGCCPDU choice";
+            return false;
+        }
+
+        cursor++;                                          // ConnectGCCPDU choice
+
+        if (g.Length < cursor + 2)
+        {
+            problem = "truncated before the user id";
+            return false;
+        }
+
+        userId = (ushort)(((g[cursor] << 8) | g[cursor + 1]) + Rdp.McsUserChannelBase);
+        nodeId = userId;
+        cursor += 2;
+
+        return true;
     }
 
     /// <summary>Build an MCS Erect Domain Request (MS-RDPBCGR 2.2.1.3.6.1).</summary>

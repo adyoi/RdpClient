@@ -85,8 +85,15 @@ public static class Rdp
     public const ushort McsGlobalChannel = 1007;
     public const ushort McsUserChannelBase = 1001;
 
-    public const string GccConferenceName = "McsCnxn";
-    public const ushort GccConferenceLabel = 0x0001;
+    /// <summary>
+    /// The conference name carried in a T.125 Connect-Initial.
+    /// </summary>
+    /// <remarks>
+    /// PER encodes this as a numeric string, so it is digits only. "McsCnxn"
+    /// is the H.221 node label from the older T.125 CCPDU and does not belong
+    /// here; a real client sends a single digit.
+    /// </remarks>
+    public const string McsConferenceName = "1";
 
     // --- Client-to-server PDU headers (MS-RDPBCGR 2.2.1.3.4.1) ------------
     //
