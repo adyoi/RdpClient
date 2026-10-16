@@ -69,22 +69,32 @@ public static class Mcs
     }
 
     /// <summary>
-    /// Wrap a Connect Initial in the X.224 Connection Request envelope (2.2.1.3).
+    /// Wrap a Connect Initial in the X.224 Data TPDU envelope (2.2.1.3.1).
     /// </summary>
     /// <remarks>
-    /// After negotiation the MCS Connect Initial travels in the same class 0
-    /// X.224 request envelope as the negotiation PDU, with no routing token.
+    /// Only the negotiation request is a Connection Request TPDU. Everything
+    /// after it - the Connect Initial, the Erect Domain, the Attach User, the
+    /// channel join - travels in a Data TPDU, which is a different shape:
+    /// LI, DT code, EOT, then the user data. A DT has no destination or source
+    /// reference, so reusing the CR envelope writes five octets the server reads
+    /// as payload. xrdp says so plainly:
+    /// <c>xrdp_iso_recv only supports processing [ITU-T X.224] DT-TPDU (Data)
+    /// headers. Received TPDU header: length indicator 0, TDPU code 0xe0</c>
     /// </remarks>
     public static byte[] BuildConnectInitialPdu(ConnectInitialOptions options)
     {
         byte[] mcs = BuildConnectInitial(options);
-        var x224 = new ByteWriter(mcs.Length + 6);
-        x224.U8(0);                        // length indicator
-        x224.U8(Rdp.X224ConnectionRequest);
-        x224.U16(0x0000);                  // destination reference
-        x224.U16(0x0000);                  // source reference
-        x224.U8(0x00);                     // class option
-        return Negotiation.Tpkt(x224.Bytes(mcs).ToArray());
+        return BuildDataPdu(mcs);
+    }
+
+    /// <summary>Wrap MCS application data in TPKT + X.224 Data TPDU.</summary>
+    private static byte[] BuildDataPdu(byte[] payload)
+    {
+        var x224 = new ByteWriter(payload.Length + 3);
+        x224.U8(2);                        // length indicator: LI octet and code
+        x224.U8(Rdp.X224Data);
+        x224.U8(0x80);                     // EOT (end of TSDU mark), TPDU-NR 0
+        return Negotiation.Tpkt(x224.Bytes(payload).ToArray());
     }
 
     public sealed record ConnectResponse(
