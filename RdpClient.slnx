@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/RdpClient.Cli/RdpClient.Cli.csproj" />
+    <Project Path="src/RdpClient.Protocol/RdpClient.Protocol.csproj" />
+    <Project Path="src/RdpClient/RdpClient.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/RdpClient.Protocol.Tests/RdpClient.Protocol.Tests.csproj" />
+  </Folder>
+</Solution>

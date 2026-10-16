@@ -1,0 +1,42 @@
+# Build output
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+artifacts/
+publish/
+
+# Visual Studio / Rider / VS Code
+.vs/
+.idea/
+*.user
+*.suo
+
+# WinUI / MSIX
+AppPackages/
+BundleArtifacts/
+*.appx
+*.appxbundle
+*.msix
+*.msixbundle
+*.appxupload
+*.appxmanifest.xml
+*.pri
+
+# Test output
+TestResults/
+coverage*.xml
+*.coverage
+
+# Generated documentation site
+docs/_site/
+
+# Secrets — never commit credentials
+.env
+*.rdp
+secrets.json
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini

@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>RdpClient.Protocol</RootNamespace>
+    <AssemblyName>RdpClient.Protocol</AssemblyName>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- CS1591: the XML file is generated so IntelliSense works. Requiring a
+         comment on every trivial accessor adds noise without adding
+         information; anything non-obvious is documented at the member. -->
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <!-- The protocol core deliberately has no UI dependency so it can be
+         reused from a non-Windows front end. -->
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+</Project>

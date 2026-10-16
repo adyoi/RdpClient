@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "RdpClient (Package)": {
+      "commandName": "MsixPackage"
+    },
+    "RdpClient (Unpackaged)": {
+      "commandName": "Project"
+    }
+  }
+}
