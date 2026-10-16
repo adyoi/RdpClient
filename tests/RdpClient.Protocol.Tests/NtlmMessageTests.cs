@@ -107,16 +107,17 @@ public class NtlmMessageTests
         Assert.Equal(1u, BitConverter.ToUInt32(message, 8));
 
         // MS-NLMP 2.2.1.1: DomainName and Workstation are each
-        // { Length(2), MaxLen(2), BufferOffset(2) } at offsets 16 and 24.
-        // With a workstation supplied its length is non-zero and points at the
+        // { Length(2), MaxLen(2), BufferOffset(4) } at offsets 16 and 24, so
+        // the BufferOffset members occupy four octets at 20 and 28. With a
+        // workstation supplied its length is non-zero and points at the
         // payload; the domain is always empty.
         Assert.Equal(0, BitConverter.ToUInt16(message, 16));
         Assert.Equal(0, BitConverter.ToUInt16(message, 18));
-        Assert.Equal(40, BitConverter.ToUInt16(message, 20));
+        Assert.Equal(40u, BitConverter.ToUInt32(message, 20));
 
         ushort workstationLength = BitConverter.ToUInt16(message, 24);
         Assert.Equal("RDPCLIENT".Length * 2, workstationLength);
-        Assert.Equal(40, BitConverter.ToUInt16(message, 28));
+        Assert.Equal(40u, BitConverter.ToUInt32(message, 28));
 
         // The flag may only be set when the name is really in the payload.
         Assert.True(FlagsOf(message).HasFlag(NtlmFlags.NegotiateOemWorkstationSupplied));

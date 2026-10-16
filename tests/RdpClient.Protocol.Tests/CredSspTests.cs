@@ -80,6 +80,37 @@ public class CredSspTests
     }
 
     [Fact]
+    public void BuildRequest_EncodesALengthThatNeedsTwoOctets()
+    {
+        byte[] token = new byte[300];
+
+        byte[] actual = CredSsp.BuildRequest([token]);
+
+        // 300 does not fit in one length octet, so the long form announces two:
+        // 0x82 hi lo, most significant octet first. Every nesting level that
+        // outgrows one octet does the same, and each of them costs one extra
+        // octet for the second length byte:
+        //   negoToken [0] OCTET STRING  04 82 01 2C <300>          304
+        //   NegoDataItem   SEQUENCE      30 82 01 34 <304>          312
+        //   NegoData       SEQUENCE OF   30 82 01 38 <312>          316
+        //   negoTokens [1]               A1 82 01 3C <316>          320
+        //   version [0] { INTEGER 6 }   A0 03 02 01 06                5
+        //   TSRequest       SEQUENCE     30 82 01 45 <325>          329
+        Assert.Equal(0x30, actual[0]);
+        Assert.Equal(0x82, actual[1]);
+        Assert.Equal(0x01, actual[2]);
+        Assert.Equal(0x45, actual[3]);
+        Assert.Equal(329, actual.Length);
+
+        // The length octets must be read back most significant first, not in the
+        // order the encoder collected them.
+        CredSsp.Request parsed = CredSsp.ParseRequest(actual);
+        byte[] parsedToken = Assert.Single(parsed.NegoTokens);
+        Assert.Equal(300, parsedToken.Length);
+        Assert.Equal(token, parsedToken);
+    }
+
+    [Fact]
     public void ParseRequest_RoundTripsTheNegotiateRequest()
     {
         byte[] token = FromHex("4e544c4d5353500001000000");

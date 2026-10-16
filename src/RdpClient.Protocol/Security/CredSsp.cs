@@ -460,25 +460,30 @@ public static class CredSsp
             return [(byte)length];
         }
 
-        var bytes = new List<byte>();
-        int value = length;
-        while (value > 0)
+        // Long form: the first octet announces how many length octets follow,
+        // and they arrive most-significant first. Collect least-significant
+        // first, then reverse once, so the common short form stays a single
+        // allocation while the long form stays linear rather than quadratic.
+        var octets = new List<byte>(5);
+        int remaining = length;
+        while (remaining > 0)
         {
-            bytes.Insert(0, (byte)(value & 0xFF));
-            value >>= 8;
+            octets.Add((byte)(remaining & 0xFF));
+            remaining >>= 8;
         }
 
-        bytes.Insert(0, (byte)(0x80 | bytes.Count));
-        return [.. bytes];
+        octets.Reverse();
+        octets.Insert(0, (byte)(0x80 | octets.Count));
+        return [.. octets];
     }
 
     /// <summary>
     /// Encode a non-negative integer as a DER INTEGER content octet string.
     /// </summary>
     /// <remarks>
-    /// A leading zero is required when the top bit of the first octet is set, or
-    /// the value reads as negative. Encoding 6 as <c>06</c> is correct because
-    /// the top bit is clear.
+    /// A leading zero is required when the most significant octet carries the
+    /// sign bit, or the value reads as negative. Encoding 6 as <c>06</c> is
+    /// correct because the top bit is clear.
     /// </remarks>
     private static byte[] EncodeInteger(int value)
     {
@@ -493,20 +498,23 @@ public static class CredSsp
             return [0x00];
         }
 
-        var bytes = new List<byte>();
+        // Least-significant octet first, reversed at the end. The leading zero
+        // is needed only when the most significant octet carries the sign bit.
+        var octets = new List<byte>();
         int remaining = value;
         while (remaining > 0)
         {
-            bytes.Insert(0, (byte)(remaining & 0xFF));
+            octets.Add((byte)(remaining & 0xFF));
             remaining >>= 8;
         }
 
-        if ((bytes[0] & 0x80) != 0)
+        if ((octets[^1] & 0x80) != 0)
         {
-            bytes.Insert(0, 0x00);
+            octets.Add(0x00);
         }
 
-        return [.. bytes];
+        octets.Reverse();
+        return [.. octets];
     }
 
     private static void WalkElements(byte[] data, Action<byte, byte[]> visit)

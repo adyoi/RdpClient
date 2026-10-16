@@ -154,4 +154,42 @@ public class NtlmSessionTests
         Assert.Equal(88u, BitConverter.ToUInt32(message, 24));
         Assert.Equal(Encoding.Unicode.GetByteCount("alice"), BitConverter.ToUInt16(message, 36));
     }
+
+    [Fact]
+    public void Authenticate_WritesTheBufferOffsetAsFourOctets()
+    {
+        // MS-NLMP 2.2.1.3 declares BufferOffset as 32 bits, and ReadField reads
+        // it that way. A user name long enough to push the following offsets
+        // past 65535 shows the difference: a 16-bit write would store
+        // 66272 - 65536 = 736 and the descriptor would point into the middle of
+        // the user name.
+        const int NtResponseLength = 184;
+        string user = new('u', 33_000); // 66,000 bytes of UTF-16
+        string workstation = "RDPCLIENT";
+
+        byte[] message = Ntlm.BuildAuthenticateMessage(
+            user, string.Empty, workstation, new byte[NtResponseLength],
+            NtlmFlags.NegotiateUnicode, new byte[8], new byte[16]);
+
+        uint ntOffset = 88;
+        uint domainOffset = ntOffset + NtResponseLength;
+        uint userOffset = domainOffset;                      // empty domain
+        uint workstationOffset = userOffset + (uint)Encoding.Unicode.GetByteCount(user);
+        uint keyOffset = workstationOffset + (uint)Encoding.Unicode.GetByteCount(workstation);
+
+        // Each descriptor's BufferOffset is the fourth member: at 24, 32, 40,
+        // 48 and 56, four octets wide.
+        Assert.Equal(ntOffset, BitConverter.ToUInt32(message, 24));
+        Assert.Equal(domainOffset, BitConverter.ToUInt32(message, 32));
+        Assert.Equal(userOffset, BitConverter.ToUInt32(message, 40));
+        Assert.Equal(workstationOffset, BitConverter.ToUInt32(message, 48));
+        Assert.Equal(keyOffset, BitConverter.ToUInt32(message, 56));
+
+        // The regression this pins: the upper two octets are written. A 16-bit
+        // write left them zero, so the descriptor read back as 736 instead of
+        // 66272 and pointed into the middle of the user name.
+        Assert.True(workstationOffset > ushort.MaxValue);
+        Assert.Equal(new byte[] { 0xE0, 0x02, 0x01, 0x00 }, message[48..52]);
+        Assert.Equal(keyOffset + 16, (uint)message.Length);
+    }
 }

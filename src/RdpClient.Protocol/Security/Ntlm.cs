@@ -145,16 +145,16 @@ public static class Ntlm
         BinaryPrimitivesCompat.WriteUInt32LittleEndian(message.AsSpan(8), NtlmMessageType.Negotiate);
         BinaryPrimitivesCompat.WriteUInt32LittleEndian(message.AsSpan(12), (uint)effective);
 
-        // Domain and workstation are { Length(2), MaxLen(2), BufferOffset(2) }
+        // Domain and workstation are { Length(2), MaxLen(2), BufferOffset(4) }
         // starting at offset 16 and 24, so the BufferOffset members sit at 20
         // and 28. The domain is always empty; the workstation follows it.
         BinaryPrimitivesCompat.WriteUInt16LittleEndian(message.AsSpan(16), 0);
         BinaryPrimitivesCompat.WriteUInt16LittleEndian(message.AsSpan(18), 0);
-        BinaryPrimitivesCompat.WriteUInt16LittleEndian(message.AsSpan(20), PayloadOffset);
+        BinaryPrimitivesCompat.WriteUInt32LittleEndian(message.AsSpan(20), PayloadOffset);
 
         BinaryPrimitivesCompat.WriteUInt16LittleEndian(message.AsSpan(24), (ushort)workstationBytes.Length);
         BinaryPrimitivesCompat.WriteUInt16LittleEndian(message.AsSpan(26), (ushort)workstationBytes.Length);
-        BinaryPrimitivesCompat.WriteUInt16LittleEndian(message.AsSpan(28), PayloadOffset);
+        BinaryPrimitivesCompat.WriteUInt32LittleEndian(message.AsSpan(28), PayloadOffset);
 
         ClientVersion.CopyTo(message.AsSpan(32));
         workstationBytes.CopyTo(message.AsSpan(PayloadOffset));
@@ -202,11 +202,11 @@ public static class Ntlm
 
         // LM response stays empty: NTLMv2 has no LM response.
         WriteField(message.AsSpan(12), 0, 0, 0);
-        WriteField(message.AsSpan(20), (ushort)ntResponse.Length, (ushort)ntResponse.Length, (ushort)ntOffset);
-        WriteField(message.AsSpan(28), (ushort)domainBytes.Length, (ushort)domainBytes.Length, (ushort)domainOffset);
-        WriteField(message.AsSpan(36), (ushort)userBytes.Length, (ushort)userBytes.Length, (ushort)userOffset);
-        WriteField(message.AsSpan(44), (ushort)workstationBytes.Length, (ushort)workstationBytes.Length, (ushort)workstationOffset);
-        WriteField(message.AsSpan(52), (ushort)keyBytes.Length, (ushort)keyBytes.Length, (ushort)keyOffset);
+        WriteField(message.AsSpan(20), (ushort)ntResponse.Length, (ushort)ntResponse.Length, (uint)ntOffset);
+        WriteField(message.AsSpan(28), (ushort)domainBytes.Length, (ushort)domainBytes.Length, (uint)domainOffset);
+        WriteField(message.AsSpan(36), (ushort)userBytes.Length, (ushort)userBytes.Length, (uint)userOffset);
+        WriteField(message.AsSpan(44), (ushort)workstationBytes.Length, (ushort)workstationBytes.Length, (uint)workstationOffset);
+        WriteField(message.AsSpan(52), (ushort)keyBytes.Length, (ushort)keyBytes.Length, (uint)keyOffset);
         BinaryPrimitivesCompat.WriteUInt32LittleEndian(message.AsSpan(60), (uint)flags);
 
         // MIC (offset 72, 16 bytes) is only present when the server offered
@@ -261,9 +261,6 @@ public static class Ntlm
             Slice(message, infoOffset, infoLen));
     }
 
-    private static byte[] Slice(byte[] message, uint offset, int length) =>
-        offset + (uint)length <= message.Length ? message.AsSpan((int)offset, length).ToArray() : [];
-
     /// <summary>Read a <c>{ Len, MaxLen, Offset }</c> field descriptor.</summary>
     /// <remarks>
     /// The descriptor is Length(2), MaxLen(2), BufferOffset(4) - a 32-bit
@@ -277,20 +274,28 @@ public static class Ntlm
         (BinaryPrimitivesCompat.ReadUInt16LittleEndian(field[..2]),
          BinaryPrimitivesCompat.ReadUInt32LittleEndian(field[4..]));
 
-    private static void WriteField(Span<byte> destination, ushort maxLength, ushort length, ushort offset)
+    /// <summary>
+    /// Write one field descriptor: Length(2), MaxLen(2), BufferOffset(4).
+    /// </summary>
+    /// <remarks>
+    /// <see cref="ReadField"/> reads the same layout, so the BufferOffset is a
+    /// 32-bit value and must be written as four octets; a 16-bit write leaves
+    /// the upper half of the offset at zero, which only agrees with the reader
+    /// while the offset fits in 65535.
+    /// </remarks>
+    private static void WriteField(Span<byte> destination, ushort length, ushort maxLength, uint offset)
     {
-        BinaryPrimitivesCompat.WriteUInt16LittleEndian(destination, maxLength);
-        BinaryPrimitivesCompat.WriteUInt16LittleEndian(destination[2..], length);
-        BinaryPrimitivesCompat.WriteUInt16LittleEndian(destination[4..], offset);
+        BinaryPrimitivesCompat.WriteUInt16LittleEndian(destination, length);
+        BinaryPrimitivesCompat.WriteUInt16LittleEndian(destination[2..], maxLength);
+        BinaryPrimitivesCompat.WriteUInt32LittleEndian(destination[4..], offset);
     }
 
-    private static int Append(List<byte> payload, byte[] field, int offset)
-    {
-        payload.AddRange(field);
-        return offset + field.Length;
-    }
+    private static byte[] Slice(byte[] message, uint offset, int length) =>
+        offset <= (uint)message.Length && length <= message.Length - (int)offset
+            ? message.AsSpan((int)offset, length).ToArray()
+            : [];
 
-        /// <summary>
+    /// <summary>
     /// Derive the NTLMv2 session base key (MS-NLMP 3.4.4.2).
     /// </summary>
     /// <remarks>
