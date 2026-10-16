@@ -226,10 +226,19 @@ public sealed class RdpConnection : IAsyncDisposable
                     return HandshakeStage.Failed;
                 }
 
+                if (_tls?.ServerCertificate is null)
+                {
+                    FailureReason = "the server presented no certificate, so the CredSSP "
+                        + "channel binding cannot be computed";
+                    Report(HandshakeStage.TlsEstablished, FailureReason, isError: true);
+                    return HandshakeStage.Failed;
+                }
+
                 var authenticator = new NtlmAuthenticator(
                     options.User.UserName,
                     options.User.Domain,
                     options.User.Password,
+                    CredSsp.ExtractSubjectPublicKey(_tls.ServerCertificate),
                     trace: message => Report(HandshakeStage.TlsEstablished, message));
                 await authenticator.AuthenticateAsync(_channel, cancellationToken).ConfigureAwait(false);
                 Report(HandshakeStage.Authenticated,

@@ -47,10 +47,11 @@ found by diffing against a working reference implementation.
 
 ### Known issue
 
-Nothing is known broken in the protocol path. **NTLM authentication now
-completes**: the server accepts the AUTHENTICATE and answers
-`STATUS_LOGON_FAILURE` (`0xC000006D`) instead of `SEC_E_INVALID_TOKEN`
-(`0x80090308`). The CredSSP exchange works end to end.
+The protocol path is not known broken. **NTLM authentication completes**: the
+server accepts the AUTHENTICATE and answers `STATUS_LOGON_FAILURE`
+(`0xC000006D`) where it used to answer `SEC_E_INVALID_TOKEN` (`0x80090308`).
+The remaining failure is a credential or a channel-binding question, not a
+malformed PDU.
 
 - **MD4 was wrong in three separate ways**, and a wrong NT hash makes *every*
   password fail with `STATUS_LOGON_FAILURE`, which is indistinguishable from a
@@ -68,16 +69,19 @@ completes**: the server accepts the AUTHENTICATE and answers
   messages.
 - `Rc4` is implemented directly, since .NET no longer ships one and NTLM uses it
   as a raw key schedule with no derivation.
+- The CredSSP version 6 channel binding (MS-CSSP 3.1.5 step 3) is computed and
+  sent with the AUTHENTICATE: a 32-byte client nonce, a SHA-256 over the magic
+  string, the nonce and the server's `SubjectPublicKey`, sealed with the
+  client-to-server sealing key `MD5(SessionKey || magic)`.
 
-Two details were wrong at first and are recorded because both produce a
-plausible message rather than an error: the MIC is keyed with the *session key*,
-not the session base key, and `EncryptedRandomSessionKey` is
-`RC4(SessionBaseKey, SessionKey)` and is not optional.
+### Verification note
 
-**Lesson worth keeping:** MD4 has no security value and is here only because
-MS-NLMP names it, which is exactly why it sat untested for so long. Anything
-implemented to satisfy a specification, rather than to be used, needs a
-known-answer test or it will quietly be wrong.
+Authentication could not be confirmed end to end. The only reachable host is an
+ngrok tunnel, and `mstsc.exe` itself cannot complete a connection through it:
+it holds an established TCP connection and sits at "Configuring remote
+session..." indefinitely. A local Windows host is available and is used as the
+test target, but its `RDP` account has a different password, so it can only
+confirm rejection, never acceptance.
 
 ### Settled
 

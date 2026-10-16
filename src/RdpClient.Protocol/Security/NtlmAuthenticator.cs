@@ -21,26 +21,33 @@ public sealed class NtlmAuthenticator
 {
     private const int MaxTokenBytes = 64 * 1024;
 
+    /// <summary>Length of the CredSSP clientNonce (MS-CSSP 2.2.1).</summary>
+    private const int ClientNonceLength = 32;
+
     private readonly string _userName;
     private readonly string _domain;
     private readonly string _password;
     private readonly string _workstation;
+    private readonly byte[] _serverPublicKey;
     private readonly Action<string>? _trace;
 
     public NtlmAuthenticator(
         string userName,
         string domain,
         string password,
+        byte[] serverPublicKey,
         string workstation = "RDPCLIENT",
         Action<string>? trace = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(userName);
         ArgumentNullException.ThrowIfNull(password);
+        ArgumentNullException.ThrowIfNull(serverPublicKey);
 
         _userName = userName;
         // RDP frequently presents a bare user name; an empty domain is legal.
         _domain = domain ?? string.Empty;
         _password = password;
+        _serverPublicKey = serverPublicKey;
         _workstation = workstation;
         _trace = trace;
     }
@@ -63,7 +70,7 @@ public sealed class NtlmAuthenticator
         // travels bare in negoToken. SPNEGO is only added for Kerberos; the
         // reference implementation uses NTLM directly here.
         byte[] negotiate = Ntlm.BuildNegotiateMessage(_workstation);
-        await WriteRequestAsync(channel, [negotiate], cancellationToken).ConfigureAwait(false);
+        await WriteRequestAsync(channel, [negotiate], cancellationToken: cancellationToken).ConfigureAwait(false);
 
         // 2. The server answers with a TSRequest carrying the CHALLENGE.
         _trace?.Invoke("<- awaiting TSRequest");
@@ -116,7 +123,18 @@ public sealed class NtlmAuthenticator
         Ntlm.ComputeMic(sessionKey, negotiate, challengeToken, authenticate)
             .CopyTo(authenticate.AsSpan(Ntlm.MicOffset));
 
-        await WriteRequestAsync(channel, [authenticate], cancellationToken).ConfigureAwait(false);
+        // MS-CSSP 3.1.5 step 3: CredSSP version 5 and above bind the TLS channel
+        // with a SHA-256 hash over a client nonce and the server's public key,
+        // sealed with the client-to-server sealing key, and sent in the same
+        // TSRequest as the last negoToken.
+        byte[] sealingKey = Ntlm.ComputeDirectionalKey(sessionKey, Ntlm.ClientToServerSealingMagic);
+        byte[] clientNonce = RandomNumberGenerator.GetBytes(ClientNonceLength);
+        byte[] bindingHash = CredSsp.ComputeBindingHash(
+            CredSsp.ClientToServerBindingHash, clientNonce, _serverPublicKey);
+        byte[] publicKeyAuth = Rc4.Transform(sealingKey, bindingHash);
+
+        await WriteRequestAsync(channel, [authenticate], publicKeyAuth, clientNonce, cancellationToken)
+            .ConfigureAwait(false);
 
         // 4. Final request: success, or the NTSTATUS the server reports.
         CredSsp.Request result = await ReadRequestAsync(channel, cancellationToken).ConfigureAwait(false);
@@ -136,11 +154,14 @@ public sealed class NtlmAuthenticator
     private async Task WriteRequestAsync(
         Stream channel,
         IReadOnlyList<byte[]> negoTokens,
-        CancellationToken cancellationToken)
+        byte[]? publicKeyAuth = null,
+        byte[]? clientNonce = null,
+        CancellationToken cancellationToken = default)
     {
-        byte[] request = CredSsp.BuildRequest(negoTokens);
+        byte[] request = CredSsp.BuildRequest(negoTokens, pubKeyAuth: publicKeyAuth, clientNonce: clientNonce);
         string kinds = string.Join(", ", negoTokens.Select(Ntlm.DescribeType));
-        _trace?.Invoke($"-> TSRequest {request.Length} bytes: {kinds}");
+        string extra = publicKeyAuth is null ? "" : $" + pubKeyAuth({publicKeyAuth.Length}) + clientNonce";
+        _trace?.Invoke($"-> TSRequest {request.Length} bytes: {kinds}{extra}");
         _trace?.Invoke($"   {Convert.ToHexString(request).ToLowerInvariant()}");
         await channel.WriteAsync(request, cancellationToken).ConfigureAwait(false);
         await channel.FlushAsync(cancellationToken).ConfigureAwait(false);

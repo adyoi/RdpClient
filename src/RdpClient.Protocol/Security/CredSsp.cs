@@ -1,3 +1,7 @@
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
+
 namespace RdpClient.Protocol.Security;
 
 /// <summary>
@@ -286,6 +290,126 @@ public static class CredSsp
         throw new NtlmAuthenticationException(
             $"the server rejected the CredSSP exchange with NTSTATUS 0x{unchecked((uint)status):x8} "
             + $"(0x{status:x8})");
+    }
+
+    /// <summary>The magic string for the client-to-server binding hash.</summary>
+    /// <remarks>
+    /// MS-CSSP 3.1.5 step 3. The NUL terminator is part of the hashed bytes and
+    /// is appended by <see cref="ComputeBindingHash"/>.
+    /// </remarks>
+    public const string ClientToServerBindingHash = "CredSSP Client-To-Server Binding Hash";
+
+    /// <summary>The magic string for the server-to-client binding hash.</summary>
+    public const string ServerToClientBindingHash = "CredSSP Server-To-Client Binding Hash";
+
+    /// <summary>
+    /// Compute the CredSSP channel binding hash (MS-CSSP 3.1.5 step 3).
+    /// </summary>
+    /// <remarks>
+    /// <c>SHA256(Magic, Nonce, SubjectPublicKey)</c>. The magic string is hashed
+    /// <em>with</em> its NUL terminator. The result proves the client is talking
+    /// to the host that presented this certificate rather than to a relay that
+    /// terminated TLS separately.
+    /// </remarks>
+    /// <param name="magic">One of the binding hash constants.</param>
+    /// <param name="nonce">The 32 random bytes sent in <c>clientNonce</c>.</param>
+    /// <param name="subjectPublicKey">From <see cref="ExtractSubjectPublicKey"/>.</param>
+    public static byte[] ComputeBindingHash(string magic, byte[] nonce, byte[] subjectPublicKey)
+    {
+        ArgumentNullException.ThrowIfNull(magic);
+        ArgumentNullException.ThrowIfNull(nonce);
+        ArgumentNullException.ThrowIfNull(subjectPublicKey);
+
+        var magicBytes = new byte[magic.Length + 1];
+        Encoding.ASCII.GetBytes(magic, magicBytes);
+
+        var material = new byte[magicBytes.Length + nonce.Length + subjectPublicKey.Length];
+        magicBytes.CopyTo(material, 0);
+        nonce.CopyTo(material, magicBytes.Length);
+        subjectPublicKey.CopyTo(material, magicBytes.Length + nonce.Length);
+
+        return SHA256.HashData(material);
+    }
+
+    /// <summary>
+    /// Extract the <c>SubjectPublicKey</c> bytes from a server certificate.
+    /// </summary>
+    /// <remarks>
+    /// MS-CSSP hashes "the ASN.1-encoded SubjectPublicKey sub-field of
+    /// SubjectPublicKeyInfo" (RFC 3280 section 4.1), which is the contents of the
+    /// BIT STRING - the key bits without the tag, length and unused-bit count.
+    /// It is not the DER of the whole SubjectPublicKeyInfo, and not the raw
+    /// modulus and exponent.
+    /// </remarks>
+    public static byte[] ExtractSubjectPublicKey(X509Certificate2 certificate)
+    {
+        ArgumentNullException.ThrowIfNull(certificate);
+
+        byte[] der = certificate.RawData;
+
+        // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
+        //
+        // Parsing der yields the Certificate itself as a single element, so its
+        // three fields are the contents of that element. Each of those in turn
+        // has to be descended into again before the TBS fields are visible.
+        var outer = ReadSequenceElements(der);
+        if (outer.Count != 1 || outer[0].Tag != TagSequence)
+        {
+            throw new InvalidDataException("server certificate is not a DER SEQUENCE");
+        }
+
+        var certificateFields = ReadSequenceElements(outer[0].Content);
+        if (certificateFields.Count == 0 || certificateFields[0].Tag != TagSequence)
+        {
+            throw new InvalidDataException("server certificate has no tbsCertificate");
+        }
+
+        // Walk the TBSCertificate elements looking for SubjectPublicKeyInfo, which
+        // is the only SEQUENCE holding an AlgorithmIdentifier followed by a
+        // BIT STRING.
+        foreach (DerElement field in ReadSequenceElements(certificateFields[0].Content))
+        {
+            if (field.Tag != TagSequence)
+            {
+                continue;
+            }
+
+            var spki = ReadSequenceElements(field.Content);
+            if (spki.Count == 2 && spki[0].Tag == TagSequence && spki[1].Tag == TagBitString)
+            {
+                // The content of a BIT STRING starts with the count of unused
+                // trailing bits, which is not part of the key.
+                return spki[1].Content[1..];
+            }
+        }
+
+        throw new InvalidDataException("server certificate has no SubjectPublicKeyInfo");
+    }
+
+    private const byte TagBitString = 0x03;
+
+    /// <summary>A parsed TLV: its tag, the octets its header occupied, and its content.</summary>
+    private readonly record struct DerElement(byte Tag, int HeaderLength, byte[] Content);
+
+    private static List<DerElement> ReadSequenceElements(byte[] content)
+    {
+        var elements = new List<DerElement>();
+        int position = 0;
+
+        while (position < content.Length)
+        {
+            byte tag = content[position++];
+            int length = ReadLength(content, ref position);
+            if (position + length > content.Length)
+            {
+                break;
+            }
+
+            elements.Add(new DerElement(tag, position, content.AsSpan(position, length).ToArray()));
+            position += length;
+        }
+
+        return elements;
     }
 
     // --- BER primitives --------------------------------------------------------

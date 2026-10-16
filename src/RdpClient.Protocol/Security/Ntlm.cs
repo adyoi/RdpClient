@@ -358,6 +358,39 @@ public static class Ntlm
         ReadOnlySpan<byte> sessionKey) =>
         Rc4.Transform(sessionBaseKey, sessionKey);
 
+    /// <summary>
+    /// Derive a sealing or signing key from the session key (MS-NLMP 4.2).
+    /// </summary>
+    /// <remarks>
+    /// <c>MD5(SessionKey || Magic || 0x00)</c>. The confidentiality service does
+    /// <em>not</em> use the session key directly: CredSSP seals the public key
+    /// proof with the client-to-server sealing key, so sealing with the session
+    /// key produces bytes the peer cannot decrypt.
+    /// </remarks>
+    /// <param name="sessionKey">The negotiated session key.</param>
+    /// <param name="magic">One of the sealing or signing magic constants.</param>
+    public static byte[] ComputeDirectionalKey(ReadOnlySpan<byte> sessionKey, string magic)
+    {
+        ArgumentNullException.ThrowIfNull(magic);
+
+        var material = new byte[magic.Length + 1];
+        Encoding.ASCII.GetBytes(magic, material);
+
+        var input = new byte[sessionKey.Length + material.Length];
+        sessionKey.CopyTo(input);
+        material.CopyTo(input.AsSpan(sessionKey.Length));
+
+        return MD5.HashData(input);
+    }
+
+    /// <summary>MS-NLMP 4.2: the client seals with the client-to-server sealing key.</summary>
+    public const string ClientToServerSealingMagic =
+        "session key to client-to-server sealing key magic constant";
+
+    /// <summary>MS-NLMP 4.2: the client signs with the client-to-server signing key.</summary>
+    public const string ClientToServerSigningMagic =
+        "session key to client-to-server signing key magic constant";
+
     /// <summary>Compute the NTLMv2 challenge response (MS-NLMP 3.3.2).
     /// </summary>
     /// <param name="ntHash">The NT hash of the account password.</param>
