@@ -106,10 +106,21 @@
 
         <!-- Handshake log -->
         <Grid Grid.Row="2" RowDefinitions="Auto,*">
-            <Grid Grid.Row="0" Margin="24,16,24,8">
+            <Grid Grid.Row="0" Margin="24,16,24,8" ColumnDefinitions="*,Auto,Auto" ColumnSpacing="8">
                 <TextBlock
+                    Grid.Column="0"
                     Text="Connection log"
-                    Style="{StaticResource BodyStrongTextBlockStyle}" />
+                    Style="{StaticResource BodyStrongTextBlockStyle}"
+                    VerticalAlignment="Center" />
+                <Button
+                    Grid.Column="1"
+                    Content="{x:Bind ViewModel.CopyButtonText, Mode=OneWay}"
+                    Command="{x:Bind ViewModel.CopyLogCommand}"
+                    ToolTipService.ToolTip="Copies the log, with the target and stage in a header, so it can be pasted into a bug report. The password is never logged, but the log does contain protocol hex - read it before posting it in public." />
+                <Button
+                    Grid.Column="2"
+                    Content="Clear"
+                    Command="{x:Bind ViewModel.ClearCommand}" />
             </Grid>
             <ListView
                 Grid.Row="1"
@@ -117,10 +128,22 @@
                 Margin="16,0,16,16"
                 ItemsSource="{x:Bind ViewModel.Log, Mode=OneWay}"
                 SelectionMode="None"
-                IsItemClickEnabled="False">
+                IsItemClickEnabled="False"
+                ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                ScrollViewer.HorizontalScrollMode="Enabled"
+                ScrollViewer.VerticalScrollBarVisibility="Auto"
+                ScrollViewer.VerticalScrollMode="Auto"
+                ScrollViewer.IsHorizontalRailEnabled="False"
+                ScrollViewer.ZoomMode="Disabled">
                 <ListView.ItemTemplate>
                     <DataTemplate x:DataType="viewModels:LogEntry">
-                        <Grid ColumnDefinitions="Auto,Auto,*" Padding="8,4" ColumnSpacing="12">
+                        <!--
+                            One line per entry, no wrapping: a handshake entry can be
+                            hundreds of characters of hex, and wrapping it across
+                            rows buries the timestamp and level that identify it. The
+                            list scrolls sideways instead, so the row stays a row.
+                        -->
+                        <Grid ColumnDefinitions="Auto,Auto,Auto" Padding="8,4" ColumnSpacing="12">
                             <TextBlock
                                 Grid.Column="0"
                                 Text="{x:Bind Timestamp}"
@@ -136,7 +159,7 @@
                             <TextBlock
                                 Grid.Column="2"
                                 Text="{x:Bind Message}"
-                                TextWrapping="Wrap"
+                                TextWrapping="NoWrap"
                                 FontFamily="Consolas"
                                 FontSize="12" />
                         </Grid>
