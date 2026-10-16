@@ -43,3 +43,4 @@ desktop.ini
 # Rust reference implementation build output
 rust/**/target/
 rust/vendor/
+rust/credssp-ref/
