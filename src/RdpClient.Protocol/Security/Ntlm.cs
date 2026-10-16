@@ -74,20 +74,32 @@ public static class Ntlm
     /// Flags a Windows client offers.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// <see cref="NtlmFlags.NegotiateKeyExchange"/> asks the server not to send
-    /// an exported session key, which is what modern RDP expects.
+    /// an exported session key.
+    /// </para>
+    /// <para>
+    /// Two flags are deliberately absent. <c>NEGOTIATE_TARGET_INFO</c> announces
+    /// that a message <em>carries</em> TargetInfo and is a server-side bit; a
+    /// client that sets it in NEGOTIATE is rejected. <c>NEGOTIATE_VERSION</c> is
+    /// included, which makes the 8-octet Version field mandatory at offset 32,
+    /// so it must carry a real version rather than zeroes.
+    /// </para>
     /// </remarks>
     public const NtlmFlags ClientFlags =
         NtlmFlags.NegotiateUnicode |
         NtlmFlags.NegotiateOem |
         NtlmFlags.RequestTarget |
         NtlmFlags.NegotiateNtlm |
+        NtlmFlags.AlwaysSign |
         NtlmFlags.NegotiateExtendedSessionSecurity |
-        NtlmFlags.NegotiateTargetInfo |
         NtlmFlags.NegotiateVersion |
         NtlmFlags.Negotiate128 |
         NtlmFlags.Negotiate56 |
         NtlmFlags.NegotiateKeyExchange;
+
+    /// <summary>Version written when <see cref="NtlmFlags.NegotiateVersion"/> is set.</summary>
+    private static ReadOnlySpan<byte> ClientVersion => [0x0A, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x0F];
 
     /// <summary>The NT hash of a password: MD4 over UTF-16LE (MS-NLMP 3.1.4.2).</summary>
     public static byte[] NtHash(string password)
@@ -112,6 +124,7 @@ public static class Ntlm
         // 24 respectively, so the BufferOffset members sit at 20 and 28.
         BinaryPrimitivesCompat.WriteUInt16LittleEndian(message.AsSpan(20), 40); // domain buffer offset
         BinaryPrimitivesCompat.WriteUInt16LittleEndian(message.AsSpan(28), 40); // workstation buffer offset
+        ClientVersion.CopyTo(message.AsSpan(32));
         return message;
     }
 
