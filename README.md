@@ -223,6 +223,11 @@ encrypted transport.
 
 Issues and pull requests are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) first.
 
+An agent working in this repository should also read [AGENTS.md](AGENTS.md). The
+`rdp-wire-format` skill under `.agent/skills/` covers the protocol work: how to
+verify a PDU against a real client, how to read a connection reset, and which
+Windows binary to decompile for a given question.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
