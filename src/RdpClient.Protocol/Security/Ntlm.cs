@@ -107,9 +107,11 @@ public static class Ntlm
         BinaryPrimitivesCompat.WriteUInt32LittleEndian(message.AsSpan(8), NtlmMessageType.Negotiate);
         BinaryPrimitivesCompat.WriteUInt32LittleEndian(message.AsSpan(12), (uint)(flags ?? ClientFlags));
 
-        // Domain and workstation are empty length-prefixed fields.
-        BinaryPrimitivesCompat.WriteUInt16LittleEndian(message.AsSpan(18), 40); // buffer offset
-        BinaryPrimitivesCompat.WriteUInt16LittleEndian(message.AsSpan(26), 40); // workstation offset
+        // Domain and workstation are empty length-prefixed fields. Each field is
+        // { LenMax(2), Length(2), BufferOffset(2) } starting at offset 16 and
+        // 24 respectively, so the BufferOffset members sit at 20 and 28.
+        BinaryPrimitivesCompat.WriteUInt16LittleEndian(message.AsSpan(20), 40); // domain buffer offset
+        BinaryPrimitivesCompat.WriteUInt16LittleEndian(message.AsSpan(28), 40); // workstation buffer offset
         return message;
     }
 
@@ -133,51 +135,43 @@ public static class Ntlm
         byte[] userBytes = Encoding.Unicode.GetBytes(userName);
         byte[] domainBytes = Encoding.Unicode.GetBytes(domain);
         byte[] workstationBytes = Encoding.Unicode.GetBytes(workstation);
+        byte[] keyBytes = encryptedRandomSessionKey.ToArray();
 
         const int HeaderLength = 88;
-        var payload = new List<byte>(userBytes.Length + domainBytes.Length
-            + workstationBytes.Length + ntResponse.Length + encryptedRandomSessionKey.Length);
-        payload.AddRange(ntResponse);
 
-        int offset = HeaderLength;
-
-        offset = Append(payload, domainBytes, offset);
-        offset = Append(payload, userBytes, offset);
-        offset = Append(payload, workstationBytes, offset);
-        offset = Append(payload, encryptedRandomSessionKey.ToArray(), offset);
-
-        var message = new byte[HeaderLength + payload.Count];
-        Signature.CopyTo(message);
-        BinaryPrimitivesCompat.WriteUInt32LittleEndian(message.AsSpan(8), NtlmMessageType.Authenticate);
-
-        // LM response is always empty: NTLMv2 has no LM response.
-        WriteField(message.AsSpan(12), 0, 0, 0);
-        WriteField(message.AsSpan(20), (ushort)ntResponse.Length, (ushort)ntResponse.Length, (ushort)HeaderLength);
-        WriteField(message.AsSpan(28), (ushort)domainBytes.Length, (ushort)domainBytes.Length, (ushort)offset);
-
-        offset = HeaderLength + ntResponse.Length;
-        offset = domainBytes.Length + offset;
-
-        WriteField(message.AsSpan(36), (ushort)userBytes.Length, (ushort)userBytes.Length, (ushort)offset);
-        WriteField(message.AsSpan(44), (ushort)workstationBytes.Length, (ushort)workstationBytes.Length, (ushort)offset);
-        WriteField(message.AsSpan(52), (ushort)encryptedRandomSessionKey.Length, (ushort)encryptedRandomSessionKey.Length, (ushort)offset);
-        BinaryPrimitivesCompat.WriteUInt32LittleEndian(message.AsSpan(60), (uint)flags);
-        message.AsSpan(72, 16).Clear();   // MIC: not computed
-
-        payload.CopyTo(message.AsSpan(HeaderLength));
-
-        // The offsets above were advanced optimistically; recompute them from
-        // the real payload layout so the server can locate each field.
-        int domainOffset = HeaderLength;
+        // The payload order is fixed by the spec: NT response, domain, user,
+        // workstation, encrypted random session key. Every field descriptor in
+        // the header carries a BufferOffset into this block, so the offsets are
+        // computed once here rather than guessed.
+        int ntOffset = HeaderLength;
+        int domainOffset = ntOffset + ntResponse.Length;
         int userOffset = domainOffset + domainBytes.Length;
         int workstationOffset = userOffset + userBytes.Length;
         int keyOffset = workstationOffset + workstationBytes.Length;
+        int total = keyOffset + keyBytes.Length;
 
+        var message = new byte[total];
+        Signature.CopyTo(message);
+        BinaryPrimitivesCompat.WriteUInt32LittleEndian(message.AsSpan(8), NtlmMessageType.Authenticate);
+
+        // LM response stays empty: NTLMv2 has no LM response.
+        WriteField(message.AsSpan(12), 0, 0, 0);
+        WriteField(message.AsSpan(20), (ushort)ntResponse.Length, (ushort)ntResponse.Length, (ushort)ntOffset);
         WriteField(message.AsSpan(28), (ushort)domainBytes.Length, (ushort)domainBytes.Length, (ushort)domainOffset);
         WriteField(message.AsSpan(36), (ushort)userBytes.Length, (ushort)userBytes.Length, (ushort)userOffset);
         WriteField(message.AsSpan(44), (ushort)workstationBytes.Length, (ushort)workstationBytes.Length, (ushort)workstationOffset);
-        WriteField(message.AsSpan(52), (ushort)encryptedRandomSessionKey.Length, (ushort)encryptedRandomSessionKey.Length, (ushort)keyOffset);
+        WriteField(message.AsSpan(52), (ushort)keyBytes.Length, (ushort)keyBytes.Length, (ushort)keyOffset);
+        BinaryPrimitivesCompat.WriteUInt32LittleEndian(message.AsSpan(60), (uint)flags);
 
+        // MIC (offset 72, 16 bytes) is only present when the server offered
+        // NegotiateKeyExchange; leaving it zeroed is the accepted encoding.
+        message.AsSpan(72, 16).Clear();
+
+        ntResponse.CopyTo(message.AsSpan(ntOffset));
+        domainBytes.CopyTo(message.AsSpan(domainOffset));
+        userBytes.CopyTo(message.AsSpan(userOffset));
+        workstationBytes.CopyTo(message.AsSpan(workstationOffset));
+        keyBytes.CopyTo(message.AsSpan(keyOffset));
         return message;
     }
 
