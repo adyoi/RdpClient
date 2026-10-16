@@ -65,15 +65,50 @@ verified against a live server. Everything after channel join is not.
 | `TS_UD_CS_CORE` / `SECURITY` / `NET` / `CLUSTER` / `USER` | 2.2.1.3.4.1–.5 | **Done** |
 | Erect Domain, Attach User, Channel Join | 2.2.1.3.6–.8 | **Done** |
 | RSA key exchange, RC4 / AES session keys | 2.2.1.4.3, 5.3.2 | Not started |
-| CredSSP / NLA (TLS + SPNEGO + NTLM) | MS-RDPEA | Not started |
+| TLS handshake for the External Security Protocol | MS-RDPEA 3.1.5.1 | **Works** (verified) |
+| CredSSP / NLA — SPNEGO + NTLM | MS-NLMP, MS-RDPEA | Incomplete |
 | Capability set exchange | 2.2.7 | Not started |
 | Bitmap / pointer / order graphics pipeline | 2.2.9 | Not started |
 | Keyboard and pointer input | 2.2.8 | Not started |
 | Virtual channel data (clipboard, drive, audio) | 2.2.6 | Not started |
 
-A modern host negotiates successfully and then selects CredSSP, so the client
-stops there and says why. It does not send an MCS Connect Initial it knows the
-server will reject.
+A modern host negotiates successfully, completes TLS, and then selects CredSSP.
+The client stops there and says why. It does not send an MCS Connect Initial it
+knows the server will reject. See [the changelog](CHANGELOG.md) for exactly what
+is verified and what is not.
+
+### What stands between this and the login screen
+
+The login screen is not one feature; it sits behind the rest of the protocol.
+Reaching it requires, in dependency order:
+
+| Step | Spec | State |
+| --- | --- | --- |
+| X.224 negotiation | 2.2.1.1 | Done |
+| TLS handshake | MS-RDPEA 3.1.5.1 | Done |
+| SPNEGO + NTLM | MS-NLMP | Incomplete |
+| CredSSP renegotiation | MS-RDPEA 3.2.1.5.1.5 | Written, not yet reachable |
+| RSA key exchange, session keys, MCS encryption | MS-RDPBCGR 5.3.2 | Not started |
+| Capability exchange (`Demand Active` / `Confirm Active`) | 2.2.7 | Not started |
+| Early User Authorization and logon information | 2.2.10.2 | Not started |
+| Bitmap and pointer rendering | 2.2.9 | Not started |
+
+## Prebuilt binaries
+
+Release assets carry a self-contained probe and a Release build of the app:
+
+| File | Size | Notes |
+| --- | --- | --- |
+| `rdpprobe.exe` | ~70 MB | Self-contained, single file. No .NET runtime needed. |
+| `RdpClient.exe` | ~0.5 MB | The WinUI app. Needs the Windows App SDK runtime. |
+
+```powershell
+$env:RDP_PASSWORD = '...'
+.\rdpprobe.exe --host 192.0.2.10 --user alice --hex
+```
+
+`rdpprobe` is the practical way to exercise the protocol; the WinUI app needs
+package identity, so build and run it with `winapp run` instead.
 
 ## Platform support
 

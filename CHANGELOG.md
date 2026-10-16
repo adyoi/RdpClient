@@ -5,6 +5,68 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-10-16
+
+External Security Protocol work. TLS now completes against a real RDP host; the
+NTLM exchange that CredSSP needs is implemented but does not yet complete.
+
+### Added
+
+- **TLS channel** (`Security/TlsChannel.cs`): the handshake MS-RDPEA 3.1.5.1
+  places on the same TCP connection, with `TERMSRV/<host>` SNI. The self-signed
+  host certificate is accepted and then reported, because RDP does not
+  chain-validate and the default policy would reject every real host.
+- **Security mode selection** (`Security/RdpSecurity.cs`): maps the negotiated
+  `SelectedProtocol` to TLS, CredSSP or none, and refuses an unknown protocol
+  rather than downgrading.
+- **NTLM** (`Security/Ntlm.cs`, `Security/Md4.cs`, `Security/NtlmAuthenticator.cs`):
+  NEGOTIATE, CHALLENGE and AUTHENTICATE messages with an NTLMv2 response. MD4 is
+  implemented because .NET does not ship it and NTLM specifies it.
+- **SPNEGO** (`Security/Spnego.cs`): BER encoding and decoding for the
+  GSS-API `NegTokenInit` / `NegTokenTarg` wrappers, plus SPNEGO error decoding.
+- **CredSSP renegotiation** (`RdpConnection.RenegotiateInsideCredSspAsync`): the
+  second `RDP_NEG_REQ` that MS-RDPEA 3.2.1.5.1.5 requires inside the
+  authenticated channel.
+- `rdpprobe` flags `--tls12`, `--tls-only` and `--credssp-only` to pin the
+  security mode while diagnosing a host.
+- Wrapped TLS and SPNEGO failures now report their root cause instead of the
+  outermost message.
+
+### Verified
+
+Against a Windows Server 2025 host (`fDenyTSConnections=0`, port 3389):
+
+- RDP negotiation selects `PROTOCOL_HYBRID_EX` and the client reports CredSSP.
+- The TLS handshake completes on both TLS 1.3 and TLS 1.2, presenting the
+  server's self-signed certificate.
+- Requesting `PROTOCOL_SSL` alone is refused with `RDP_NEG_FAILURE` code 5
+  (`SSL_REQUIRED_BY_SERVER`), so the host mandates NLA.
+
+### Not working
+
+The SPNEGO/NTLM exchange does not complete. The first token write is followed by
+a TLS decryption failure, which indicates the host answered with an alert rather
+than a challenge. The cause is not yet identified, so this is reported as a
+failure rather than papered over.
+
+### Not implemented
+
+Unchanged from 1.0.0, and all still ahead of the login screen:
+
+- CredSSP RSA key exchange and session key derivation (MS-RDPBCGR 5.3.2)
+- Encryption of MCS traffic (RC4 / AES)
+- Capability exchange (2.2.7), including the `Demand Active` / `Confirm Active`
+  pairs that begin the connection
+- Early User Authorization (2.2.10.2) and the logon-information PDUs
+- The graphics pipeline and input needed to draw a framebuffer at all
+
+### Fixed
+
+- The SPNEGO mechanism OID was double-wrapped and declared a five-octet length
+  for six octets of content, which made every token malformed.
+- `thisMech` in the GSS-API wrapper is tagged APPLICATION (`0x60`), not
+  CONTEXT-specific; the two are not interchangeable.
+
 ## [1.0.0] - 2026-10-16
 
 First release. The RDP connection sequence, implemented from Microsoft's public

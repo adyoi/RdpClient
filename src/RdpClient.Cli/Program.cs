@@ -66,6 +66,24 @@ internal static class Program
             LogTx = options.ContainsKey("hex"),
         };
 
+        if (options.ContainsKey("tls12"))
+        {
+            connectionOptions = connectionOptions with
+            {
+                TlsPolicy = System.Security.Authentication.SslProtocols.Tls12,
+            };
+        }
+
+        if (options.ContainsKey("credssp-only"))
+        {
+            connectionOptions = connectionOptions with { Security = SecurityModeSelection.CredSspOnly };
+        }
+
+        if (options.ContainsKey("tls-only"))
+        {
+            connectionOptions = connectionOptions with { Security = SecurityModeSelection.TlsOnly };
+        }
+
         await using var connection = new RdpConnection();
         connection.OnEvent += evt =>
         {
@@ -147,6 +165,10 @@ internal static class Program
               --user     user name; when set, TS_UD_CS_USER is sent
               --domain   domain for the user name
               --hex      dump transmitted PDUs as hex
+              --tls12     restrict TLS to 1.2 instead of 1.2/1.3
+              --tls-only  require PROTOCOL_SSL (TLS only, no SPNEGO)
+              --credssp-only
+                         require CredSSP
               --no-correlation
                          omit the MS-RDPBCGR 2.2.1.1.1 correlation block,
                          sending the minimal 19-byte connection request

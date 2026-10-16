@@ -4,6 +4,8 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 
+using RdpClient.Protocol.Security;
+
 namespace RdpClient.Protocol;
 
 public enum HandshakeStage
@@ -11,6 +13,9 @@ public enum HandshakeStage
     Idle,
     TcpConnected,
     Negotiated,
+    TlsEstablished,
+    Authenticated,
+    Renegotiated,
     McsAccepted,
     DomainErected,
     UserAttached,
@@ -21,7 +26,7 @@ public enum HandshakeStage
 
 public sealed record HandshakeEvent(HandshakeStage Stage, string Message, bool IsError = false);
 
-public sealed class RdpConnectionOptions
+public sealed record RdpConnectionOptions
 {
     /// <summary>IANA-assigned RDP port.</summary>
     public const int DefaultPort = 3389;
@@ -39,17 +44,45 @@ public sealed class RdpConnectionOptions
 
     /// <summary>Log each transmitted PDU as hex. Credential-bearing PDUs are never logged.</summary>
     public bool LogTx { get; init; }
+
+    /// <summary>
+    /// External security protocol to require. <see cref="SecurityModeSelection.Negotiate"/>
+    /// advertises several protocols and accepts whichever the server selects.
+    /// </summary>
+    public SecurityModeSelection Security { get; init; } = SecurityModeSelection.Negotiate;
+
+    /// <summary>TLS protocol versions to offer. Defaults to TLS 1.2 and 1.3.</summary>
+    public System.Security.Authentication.SslProtocols TlsPolicy { get; init; } =
+        System.Security.Authentication.SslProtocols.Tls12 |
+        System.Security.Authentication.SslProtocols.Tls13;
+}
+
+/// <summary>Which External Security Protocol the caller is willing to use.</summary>
+public enum SecurityModeSelection
+{
+    /// <summary>
+    /// Advertise SSL, HYBRID and HYBRID_EX and accept whatever the server picks.
+    /// This is what a normal client does.
+    /// </summary>
+    Negotiate,
+
+    /// <summary>Require <c>PROTOCOL_SSL</c>, so no SPNEGO exchange is needed.</summary>
+    TlsOnly,
+
+    /// <summary>Require CredSSP, so authentication happens over TLS.</summary>
+    CredSspOnly,
 }
 
 /// <summary>
 /// Drives the RDP connection sequence up to the MCS channel join.
 /// </summary>
 /// <remarks>
-/// This covers MS-RDPBCGR 2.2.1.1 through 2.2.1.3.8: X.224 negotiation, the
-/// MCS/GCC connection, then the domain erect, user attach and channel join that
-/// must precede any application traffic. Security (RSA key exchange or NLA) and
-/// graphics are not yet part of this stage; the log makes the stopping point
-/// explicit so a caller can tell a refused connection from an incomplete one.
+/// Covers MS-RDPBCGR 2.2.1.1 through 2.2.1.3.8: X.224 negotiation, the
+/// External Security Protocol, the MCS/GCC connection, then the domain erect,
+/// user attach and channel join that must precede any application traffic.
+/// Graphics and input are not yet part of this stage, and the log makes the
+/// stopping point explicit so a caller can tell a refused connection from an
+/// incomplete one.
 /// </remarks>
 public sealed class RdpConnection : IAsyncDisposable
 {
@@ -58,12 +91,19 @@ public sealed class RdpConnection : IAsyncDisposable
     private readonly TcpClient _client = new();
     private NetworkStream? _stream;
 
+    /// <summary>Stream carrying RDP PDUs: the TCP stream, or TLS once established.</summary>
+    private Stream? _channel;
+    private TlsChannel? _tls;
+
     public HandshakeStage Stage { get; private set; } = HandshakeStage.Idle;
     public string? SelectedProtocol { get; private set; }
     public uint? NegotiatedVersion { get; private set; }
     public string? ServerNodeId { get; private set; }
     public ushort? UserId { get; private set; }
     public string? FailureReason { get; private set; }
+
+    /// <summary>The External Security Protocol the server selected.</summary>
+    public SecurityMode SecurityMode { get; private set; } = SecurityMode.None;
 
     public event Action<HandshakeEvent>? OnEvent;
 
@@ -83,11 +123,14 @@ public sealed class RdpConnection : IAsyncDisposable
         string host = options.Host;
         int port = options.Port;
 
-        // Advertise SSL, HYBRID and HYBRID_EX, matching what mstsc requests. The
-        // server picks one; a host that only offers classic RDP selects the
-        // SSL bit.
-        const uint requestedProtocols =
-            Rdp.ProtocolSsl | Rdp.ProtocolHybrid | Rdp.ProtocolHybridEx;
+        // Advertise only the protocols the caller is willing to complete. The default
+        // offers what mstsc offers, so an unmodified host picks what it prefers.
+        uint requestedProtocols = options.Security switch
+        {
+            SecurityModeSelection.TlsOnly => Rdp.ProtocolSsl,
+            SecurityModeSelection.CredSspOnly => Rdp.ProtocolHybrid,
+            _ => Rdp.ProtocolSsl | Rdp.ProtocolHybrid | Rdp.ProtocolHybridEx,
+        };
 
         byte[]? correlationId = options.UseCorrelationId
             ? RandomNumberGenerator.GetBytes(16)
@@ -109,6 +152,10 @@ public sealed class RdpConnection : IAsyncDisposable
             Report(HandshakeStage.Idle, $"connecting to {target}:{port}...");
             await _client.ConnectAsync(target, port, cancellationToken);
             _stream = _client.GetStream();
+
+            // Everything from here is sent on the channel, which starts as the raw
+            // TCP stream and is replaced by TLS once the handshake completes.
+            _channel = _stream;
             Report(HandshakeStage.TcpConnected, $"TCP established to {target}:{port}");
 
             // --- 2.2.1.1 X.224 Connection Request with RDP_NEG_REQ ---
@@ -137,20 +184,56 @@ public sealed class RdpConnection : IAsyncDisposable
             Report(HandshakeStage.Negotiated,
                 $"{confirm.Summary}; correlation {(correlationMatched ? "echoed correctly" : "NOT echoed")}");
 
-            // The server has chosen an External Security Protocol. Anything
-            // other than plain TLS (PROTOCOL_SSL) means CredSSP, which carries a
-            // full TLS + SPNEGO + NTLM exchange before MCS may start. Sending an
-            // MCS Connect Initial now would be a protocol violation, so stop
-            // here with an accurate reason instead.
+            // --- Establish the External Security Protocol (MS-RDPEA 3.1.5.1) ---
             uint selected = confirm.SelectedProtocol ?? 0;
-            if (selected != Rdp.ProtocolSsl && selected != 0)
+            SecurityMode mode;
+            try
             {
-                FailureReason =
-                    $"server selected {Negotiation.DescribeSelectedProtocol(selected)}, which requires the "
-                    + "CredSSP/NLA handshake (TLS + SPNEGO + NTLM). That handshake is not implemented, so the "
-                    + "MCS layer cannot start.";
+                mode = SecurityModes.FromSelectedProtocol(selected);
+            }
+            catch (NotSupportedException ex)
+            {
+                FailureReason = ex.Message;
                 Report(HandshakeStage.Negotiated, FailureReason, isError: true);
                 return HandshakeStage.Failed;
+            }
+
+            SecurityMode = mode;
+            Report(HandshakeStage.Negotiated, $"External Security Protocol: {SecurityModes.Describe(mode)}");
+
+            if (SecurityModes.UsesTls(mode))
+            {
+                // The TLS handshake runs on the same TCP connection. SNI must be
+                // TERMSRV/<host>, which is what an RDP host matches its
+                // certificate against.
+                string sspiTarget = $"TERMSRV/{host}";
+                Report(HandshakeStage.Negotiated, $"starting TLS handshake, SNI '{sspiTarget}'");
+                _tls = await TlsChannel.HandshakeAsync(_stream, sspiTarget, options.TlsPolicy, cancellationToken)
+                    .ConfigureAwait(false);
+                _channel = _tls.Stream;
+                Report(HandshakeStage.TlsEstablished, _tls.DescribeCertificate());
+            }
+
+            if (SecurityModes.UsesSasl(mode))
+            {
+                // CredSSP: authenticate over the TLS channel, then the RDP
+                // negotiation is repeated inside it (MS-RDPEA 3.2.1.5.1.5).
+                if (options.User is null)
+                {
+                    FailureReason =
+                        "the server selected CredSSP, which authenticates with NTLM, but no user name was supplied";
+                    Report(HandshakeStage.TlsEstablished, FailureReason, isError: true);
+                    return HandshakeStage.Failed;
+                }
+
+                var authenticator = new NtlmAuthenticator(options.User.UserName, options.User.Domain, options.User.Password);
+                await authenticator.AuthenticateAsync(_channel, cancellationToken).ConfigureAwait(false);
+                Report(HandshakeStage.Authenticated,
+                    $"NTLM authentication succeeded for '{authenticator.AuthenticatedUser}' in domain "
+                    + $"'{authenticator.AuthenticatedDomain}'");
+
+                await RenegotiateInsideCredSspAsync(selected, cancellationToken).ConfigureAwait(false);
+                Report(HandshakeStage.Renegotiated, "repeated RDP negotiation inside the CredSSP channel");
             }
 
             // --- 2.2.1.3.4 MCS Connect Initial ---
@@ -160,9 +243,9 @@ public sealed class RdpConnection : IAsyncDisposable
                 ClientInfo = clientInfo,
             });
 
-            await _stream.WriteAsync(connectInitial, cancellationToken);
-            await _stream.FlushAsync(cancellationToken);
-            Report(HandshakeStage.Negotiated, $"sent MCS Connect Initial ({connectInitial.Length} bytes)");
+            await _channel.WriteAsync(connectInitial, cancellationToken);
+            await _channel.FlushAsync(cancellationToken);
+            Report(HandshakeStage.McsAccepted, $"sent MCS Connect Initial ({connectInitial.Length} bytes)");
 
             byte[] connectResponseRaw = await ReadTpktAsync(cancellationToken);
             var connectResponse = Mcs.ParseConnectResponse(connectResponseRaw);
@@ -177,29 +260,31 @@ public sealed class RdpConnection : IAsyncDisposable
 
             // --- 2.2.1.3.6 Erect Domain, 2.2.1.3.7 Attach User, 2.2.1.3.8 join ---
             byte[] erect = Mcs.BuildErectDomainRequest(0x03fa, Rdp.McsGlobalChannel);
-            await _stream.WriteAsync(erect, cancellationToken);
-            await _stream.FlushAsync(cancellationToken);
+            await _channel.WriteAsync(erect, cancellationToken);
+            await _channel.FlushAsync(cancellationToken);
             Report(HandshakeStage.DomainErected, $"sent Erect Domain Request ({erect.Length} bytes)");
 
             byte[] attach = Mcs.BuildAttachUserRequest(0x03fa, Rdp.McsUserChannelBase);
-            await _stream.WriteAsync(attach, cancellationToken);
-            await _stream.FlushAsync(cancellationToken);
+            await _channel.WriteAsync(attach, cancellationToken);
+            await _channel.FlushAsync(cancellationToken);
             Report(HandshakeStage.UserAttached, $"sent Attach User Request, UserID {Rdp.McsUserChannelBase}");
 
             byte[] join = Mcs.BuildChannelJoinRequest(0x03fa, Rdp.McsGlobalChannel, Rdp.McsUserChannelBase);
-            await _stream.WriteAsync(join, cancellationToken);
-            await _stream.FlushAsync(cancellationToken);
+            await _channel.WriteAsync(join, cancellationToken);
+            await _channel.FlushAsync(cancellationToken);
             Report(HandshakeStage.ChannelJoined, $"joined MCS global channel {Rdp.McsGlobalChannel}");
 
             Report(HandshakeStage.Complete,
-                "MCS channel joined. Security negotiation and graphics are not implemented yet, "
-                + "so the session will not display a desktop.");
+                "MCS channel joined. The capability exchange, graphics and input are "
+                + "not implemented yet, so the session will not display a desktop.");
             return HandshakeStage.Complete;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            FailureReason = ex.Message;
-            Report(HandshakeStage.Failed, ex.Message, isError: true);
+            // TLS and SPNEGO failures are usually wrapped; the inner message is
+            // the one that says what actually went wrong.
+            FailureReason = Describe(ex);
+            Report(HandshakeStage.Failed, FailureReason, isError: true);
             return HandshakeStage.Failed;
         }
         finally
@@ -242,6 +327,61 @@ public sealed class RdpConnection : IAsyncDisposable
         return joined.ToArray();
     }
 
+    /// <summary>
+    /// Repeat the RDP negotiation inside the CredSSP channel.
+    /// </summary>
+    /// <remarks>
+    /// MS-RDPEA 3.2.1.5.1.5 requires the client to send a second
+    /// <c>RDP_NEG_REQ</c> inside the authenticated channel, carrying
+    /// <c>PROTOCOL_HYBRID</c>. Servers reject the MCS Connect Initial that
+    /// follows if it is missing.
+    /// </remarks>
+    private async Task RenegotiateInsideCredSspAsync(uint selectedProtocol, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(_channel);
+
+        byte[] request = Negotiation.BuildConnectionRequest(
+            selectedProtocol == Rdp.ProtocolHybridEx ? Rdp.ProtocolHybridEx : Rdp.ProtocolHybrid);
+
+        await _channel.WriteAsync(request, cancellationToken).ConfigureAwait(false);
+        await _channel.FlushAsync(cancellationToken).ConfigureAwait(false);
+
+        byte[] response = await ReadTpktAsync(cancellationToken).ConfigureAwait(false);
+        var confirm = Negotiation.ParseConnectionConfirm(response);
+        if (confirm.Failed)
+        {
+            throw new RdpProtocolException(
+                $"CredSSP renegotiation refused: {confirm.Summary}");
+        }
+
+        uint inner = confirm.SelectedProtocol ?? 0;
+        if ((inner & (Rdp.ProtocolHybrid | Rdp.ProtocolHybridEx)) == 0)
+        {
+            throw new RdpProtocolException(
+                $"CredSSP renegotiation returned {Negotiation.DescribeSelectedProtocol(inner)}, "
+                + "which is not a CredSSP protocol");
+        }
+    }
+
+    /// <summary>
+    /// Flatten an exception chain into one line, so a wrapped TLS or SPNEGO
+    /// failure still reports its root cause in the handshake log.
+    /// </summary>
+    private static string Describe(Exception exception)
+    {
+        var parts = new List<string>();
+        for (Exception? current = exception; current is not null; current = current.InnerException)
+        {
+            string message = current.Message;
+            if (!parts.Contains(message))
+            {
+                parts.Add(message);
+            }
+        }
+
+        return string.Join(" -> ", parts);
+    }
+
     /// <summary>Format bytes as offset-prefixed hex, for protocol debugging.</summary>
     private static string Hex(byte[] data)
     {
@@ -263,8 +403,6 @@ public sealed class RdpConnection : IAsyncDisposable
     /// <summary>Read one complete TPKT-framed PDU.</summary>
     private async Task<byte[]> ReadTpktAsync(CancellationToken cancellationToken)
     {
-        ArgumentNullException.ThrowIfNull(_stream);
-
         // TPKT header: version(1), reserved(1), big-endian length(2).
         byte[] header = await ReadExactlyAsync(4, cancellationToken);
         int totalLength = (header[2] << 8) | header[3];
@@ -283,12 +421,13 @@ public sealed class RdpConnection : IAsyncDisposable
 
     private async Task<byte[]> ReadExactlyAsync(int count, CancellationToken cancellationToken)
     {
-        ArgumentNullException.ThrowIfNull(_stream);
+        Stream channel = _channel
+            ?? throw new InvalidOperationException("the connection is not established");
         var buffer = new byte[count];
         int read = 0;
         while (read < count)
         {
-            int n = await _stream.ReadAsync(buffer.AsMemory(read, count - read), cancellationToken);
+            int n = await channel.ReadAsync(buffer.AsMemory(read, count - read), cancellationToken);
             if (n == 0)
             {
                 throw new EndOfStreamException(
@@ -303,9 +442,13 @@ public sealed class RdpConnection : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        if (_stream is not null)
+        if (_tls is not null)
         {
-            await _stream.DisposeAsync();
+            await _tls.DisposeAsync().ConfigureAwait(false);
+        }
+        else if (_stream is not null)
+        {
+            await _stream.DisposeAsync().ConfigureAwait(false);
         }
 
         _client.Dispose();
