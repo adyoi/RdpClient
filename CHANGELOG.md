@@ -5,6 +5,49 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+NTLM corrections, plus the investigation tooling that produced them.
+
+### Fixed
+
+- `NEGOTIATE_TARGET_INFO` (`0x00800000`) was being set by the client. That flag
+  announces that a message carries TargetInfo and is server-side; a client that
+  sets it in NEGOTIATE is rejected.
+- `NEGOTIATE_VERSION` was set while the 8-octet Version field at offset 32 was
+  left all zero, which is not a valid version.
+
+### Investigation
+
+A TLS-terminating proxy (`credssp-tap.mjs`) was built to expose the CredSSP
+exchange in plaintext, because the SPNEGO tokens live inside TLS and no external
+tap can see them. It forwards the cleartext X.224 negotiation, then upgrades both
+sides to TLS and logs the decrypted traffic.
+
+What it established, in order:
+
+1. The RDP negotiation is byte-identical to what `mstsc.exe` sends.
+2. The TLS handshake completes on both TLS 1.2 and TLS 1.3.
+3. The host waits for the client's token and then resets the connection.
+4. Schannel reports that reset as "decryption operation failed", which is
+   misleading — there is no decryption failure, the peer simply went away.
+5. The generated token is internally consistent DER: the GSS-API wrapper, the
+   `NegTokenInit` and the NTLM message each declare lengths matching their
+   content, with the correct NTLM OID and a well-formed NEGOTIATE message.
+
+Six hypotheses were tested and eliminated in the process: TPKT endianness, X.224
+field order, the SPNEGO OID encoding, GSS-API tagging, the TLS version, and the
+NTLM field offsets. Each was a real defect, and each was fixed, but none was the
+cause. The host sends nothing that would explain the rejection, so without a
+known-good reference token the remaining cause cannot be narrowed further.
+
+### Security
+
+The interception certificate and its CA were installed into `CurrentUser\Root`
+during this investigation and have been removed. All six certificates added
+(`CurrentUser\Root` and `CurrentUser\My`) are deleted and the trust stores are
+back to their prior state.
+
 ## [1.1.0] - 2026-10-16
 
 External Security Protocol work. TLS now completes against a real RDP host; the
