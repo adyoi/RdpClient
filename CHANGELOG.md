@@ -34,8 +34,12 @@ that found it.
 Authentication still fails. The host now returns `SEC_E_INVALID_TOKEN`
 (`0x80090308`) instead of resetting silently, which indicates it parses the
 envelope correctly and rejects the token inside it. The remaining defect is in
-the SPNEGO or NTLM content and is not yet identified; see the open question on
-the `NtlmFlags` values in `AGENTS.md`.
+the SPNEGO or NTLM content and is not yet identified.
+
+The `NtlmFlags` values were suspected and cleared. MS-NLMP 2.2.2.5 labels the
+bits of `NegotiateFlags` (`W`=56-bit at 31, `H`=NTLM at 9, `L`=OEM workstation
+at 13, and so on), and every value in the enum matches. `ClientFlags` correctly
+encodes to `0xE2088207`.
 
 ### Investigation
 

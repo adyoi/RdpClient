@@ -173,18 +173,30 @@ parses the envelope and rejects the token *inside* it. Both a bare NTLM message
 and the SPNEGO-wrapped one produce the same status, so the remaining defect is
 inside the SPNEGO or NTLM content, not the envelope.
 
-### Open question: the NTLM flag values
+### Settled: the NTLM flag values are correct
 
-`Ntlm.ClientFlags` encodes to `0xE2088207`, which is self-consistent, but several
-members of `NtlmFlags` were found not to match the MS-NLMP 2.2.2.5 table
-(`NegotiateNtlm` is declared `0x00000200`, which is the bit the specification
-assigns to `NEGOTIATE_OEM_WORKSTATION_SUPPLIED`). The 2021 revision of the
-specification PDF expresses flags as bit positions rather than hex, so the
-authoritative mapping has not been transcribed yet.
+This looked wrong and was checked. It is not. MS-NLMP 2.2.2.5 labels the 32 bits
+of `NegotiateFlags`, which fixes every value:
 
-**Do not "fix" these values from memory.** They were already corrected once, in
-`e33c005`, and a second guess would be a regression dressed as progress. Read
-the bit-to-value mapping out of the specification first, then change them.
+```
+bit: 31 30 29 28 27 26 25 24 23 22 21 20 19 18 17 16 15 14 13 12 11 10 9  8  7  6  5  4  3  2  1  0
+lbl:  W  V  U r1 r2 r3  T  r4  S  R r5  Q  P r6  O  N  M r7  L  K  J r8  H r9  G  F  E  D r10 C  B  A
+```
+
+`W` is 56-bit encryption (bit 31), `V` key exchange (30), `U` 128-bit (29),
+`T` version (25), `S` target info (23), `R` non-NT session key (22),
+`Q` identify (20), `P` extended session security (19), `M` always sign (15),
+`L` OEM workstation supplied (13), `K` OEM domain supplied (12), `J` anonymous
+(11), `H` **NTLM** (9), `G` LM key (7), `F` datagram (6), `E` seal (5),
+`D` sign (4), `C` request target (2), `B` OEM (1), `A` Unicode (0).
+
+So `NegotiateNtlm = 0x00000200` is right, and so are
+`NegotiateOemWorkstationSupplied = 0x00002000` and
+`NegotiateOemDomainSupplied = 0x00001000`. `Ntlm.ClientFlags` encodes to
+`0xE2088207`, which matches the bytes on the wire.
+
+**Do not change these values.** They were suspected once and the suspicion was
+wrong. The NTLM NEGOTIATE is not the reason the host rejects the token.
 
 ## Conventions
 
