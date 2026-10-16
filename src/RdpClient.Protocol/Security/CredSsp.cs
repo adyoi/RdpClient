@@ -75,7 +75,11 @@ public static class CredSsp
         var fields = new List<byte[]>();
 
         // version [0] INTEGER, always present.
-        fields.Add(Context(0, EncodeInteger(ProtocolVersion)));
+        // The [0] field wraps a complete INTEGER TLV, not the integer's content
+        // octets. Writing a0 01 06 instead of a0 03 02 01 06 declares one
+        // content byte holding a bare 0x06, which is not a valid INTEGER and
+        // makes the whole request fail to parse as DER.
+        fields.Add(Context(0, Integer(ProtocolVersion)));
 
         // negoTokens [1] SEQUENCE OF SEQUENCE { negoToken [0] OCTET STRING }
         if (negoTokens is { Count: > 0 })
@@ -121,7 +125,7 @@ public static class CredSsp
     /// tests; a client never originates an error request.
     /// </remarks>
     public static byte[] BuildErrorRequest(int errorCode) =>
-        Sequence([Context(0, EncodeInteger(ProtocolVersion)), Context(4, EncodeInteger(errorCode))]);
+        Sequence([Context(0, Integer(ProtocolVersion)), Context(4, Integer(errorCode))]);
 
     /// <summary>A parsed <c>TSRequest</c>.</summary>
     /// <param name="Version">The peer's CredSSP version.</param>
@@ -180,7 +184,7 @@ public static class CredSsp
                 switch (ContextTag(tag))
                 {
                 case 0:
-                    request = request with { Version = DecodeInteger(value) };
+                    request = request with { Version = InnerInteger(value) };
                     break;
 
                 case 1:
@@ -211,7 +215,7 @@ public static class CredSsp
                     break;
 
                 case 4:
-                    request = request with { ErrorCode = DecodeInteger(value) };
+                    request = request with { ErrorCode = InnerInteger(value) };
                     break;
 
                 case 5:
@@ -308,6 +312,9 @@ public static class CredSsp
     }
 
     private static byte[] OctetString(byte[] content) => Tlv(TagOctetString, content);
+
+    /// <summary>Wrap an integer in a complete DER INTEGER TLV.</summary>
+    private static byte[] Integer(int value) => Tlv(TagInteger, EncodeInteger(value));
 
     /// <summary>
     /// Wrap content in a tag and length, using the long form above 127 bytes.
@@ -464,6 +471,36 @@ public static class CredSsp
         }
 
         return copy.AsSpan(position, length).ToArray();
+    }
+
+    /// <summary>Read an INTEGER from the complete TLV a context-tagged field holds.</summary>
+    /// <remarks>
+    /// The mirror of <see cref="Integer"/> on the encoding side: the [0] and
+    /// [4] fields contain a whole INTEGER, so the tag and length have to come
+    /// off before the value is interpreted.
+    /// </remarks>
+    private static int InnerInteger(byte[] content)
+    {
+        if (content.Length == 0)
+        {
+            throw new InvalidDataException("CredSSP INTEGER is empty");
+        }
+
+        if (content[0] != TagInteger)
+        {
+            // Tolerated: a peer that sends the value untagged still parses.
+            return DecodeInteger(content);
+        }
+
+        var copy = (byte[])content.Clone();
+        int position = 1;
+        int length = ReadLength(copy, ref position);
+        if (position + length > copy.Length)
+        {
+            throw new InvalidDataException("CredSSP INTEGER is truncated");
+        }
+
+        return DecodeInteger(copy.AsSpan(position, length).ToArray());
     }
 
     private static int DecodeInteger(byte[] content)

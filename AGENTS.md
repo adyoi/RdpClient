@@ -88,6 +88,14 @@ reason `docs/protocol.md` exists; read it before touching an encoder.
 6. **MCS integers are plain fixed-width values.** There are no T.125
    PerEncoding selector bits in RDP; a width-aware writer and reader are used
    instead.
+7. **A CredSSP `TSRequest` field declared `[n] INTEGER` wraps a whole INTEGER
+   TLV.** `version` is `a0 03 02 01 06`, not `a0 01 06`. The second declares one
+   content byte holding a bare `0x06`, which is not a valid INTEGER, so the
+   whole request stops being valid DER.
+8. **An NTLM field descriptor is `{ Length(2), MaxLen(2), BufferOffset(4) }`.**
+   The offset is 32-bit. Reading Length from `[4..6]` and Offset from `[6..8]`
+   takes the two halves of the offset instead, which silently yields the offset
+   as the length and zero as the offset.
 
 ## Verifying a wire-format change
 

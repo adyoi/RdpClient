@@ -40,3 +40,6 @@ secrets.json
 Thumbs.db
 .DS_Store
 desktop.ini
+# Rust reference implementation build output
+rust/**/target/
+rust/vendor/

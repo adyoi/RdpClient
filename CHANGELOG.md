@@ -7,39 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-The CredSSP envelope, which was missing entirely, plus the investigation tooling
-that found it.
+The CredSSP envelope, which was missing entirely, plus three encoding defects
+found by diffing against a working reference implementation.
 
 ### Fixed
 
-- **The CredSSP `TSRequest` envelope was absent.** The client wrote a bare SPNEGO
-  token straight onto the TLS channel. CredSSP (MS-CSSP 2.2.1) requires every
-  message after the handshake to be an ASN.1 `TSRequest` carrying the token in
-  `negoTokens`; the server reads those first bytes as DER, fails, and closes the
-  connection with no diagnostic. `CredSsp.cs` encodes and decodes the structure,
-  and `NtlmAuthenticator` wraps each NTLM message in it.
+- **The CredSSP `TSRequest` envelope was absent.** The client wrote a bare token
+  straight onto the TLS channel. CredSSP (MS-CSSP 2.2.1) requires every message
+  after the handshake to be an ASN.1 `TSRequest` carrying the token in
+  `negoTokens`. `CredSsp.cs` encodes and decodes the structure.
+- **The `version` field did not wrap an INTEGER.** `TSRequest.version` is
+  declared `[0] INTEGER`, which encodes as `a0 03 02 01 06`. The encoder wrote
+  `a0 01 06`, declaring a single content byte holding a bare `0x06`, which is
+  not a valid INTEGER. The request was therefore not valid DER, which is what
+  `SEC_E_INVALID_TOKEN` was reporting. This was the actual blocker.
+- **NTLM field descriptors were read from the wrong offsets.** The descriptor is
+  `{ Length(2), MaxLen(2), BufferOffset(4) }` with a 32-bit offset. Reading
+  Length from `[4..6]` and Offset from `[6..8]` takes the two halves of the
+  offset, so the CHALLENGE's `TargetInfo` came back as the first 82 bytes of the
+  message - the NTLMSSP signature included - and the AUTHENTICATE embedded a
+  whole NTLM header.
+- The NEGOTIATE flag set now matches a known-good client: `NEGOTIATE_SIGN`,
+  `NEGOTIATE_SEAL` and `NEGOTIATE_LM_KEY` are offered, and
+  `NEGOTIATE_OEM_WORKSTATION_SUPPLIED` is set only when the workstation name is
+  actually present in the payload.
 - `NEGOTIATE_TARGET_INFO` (`0x00800000`) was being set by the client. That flag
-  announces that a message carries TargetInfo and is server-side; a client that
-  sets it in NEGOTIATE is rejected.
+  announces that a message carries TargetInfo and is server-side.
 - `NEGOTIATE_VERSION` was set while the 8-octet Version field at offset 32 was
   left all zero, which is not a valid version.
 
 ### Changed
 
-- Authentication now traces what it sends and receives, so a failure names the
-  stage and the token type instead of surfacing as a flattened TLS error.
+- Authentication traces what it sends and receives, so a failure names the stage
+  and the token type instead of surfacing as a flattened TLS error.
+- The exchange now advances. The host accepts the NEGOTIATE and returns an NTLM
+  CHALLENGE, which was never true before.
+- Tests are pinned to captured bytes rather than to hand-typed hex: the CHALLENGE
+  fixture is written to `Fixtures/challenge.bin` from a live run.
 
 ### Known issue
 
-Authentication still fails. The host now returns `SEC_E_INVALID_TOKEN`
-(`0x80090308`) instead of resetting silently, which indicates it parses the
-envelope correctly and rejects the token inside it. The remaining defect is in
-the SPNEGO or NTLM content and is not yet identified.
+Authentication still fails at the AUTHENTICATE message. The server's flags
+(`0xE28A8235`) include `NEGOTIATE_KEY_EXCHANGE`, so MS-NLMP 3.1.5.1 requires the
+AUTHENTICATE to carry a message integrity code and an encrypted random session
+key. Both are currently absent, which is the likely cause of the remaining
+`SEC_E_INVALID_TOKEN`.
 
-The `NtlmFlags` values were suspected and cleared. MS-NLMP 2.2.2.5 labels the
-bits of `NegotiateFlags` (`W`=56-bit at 31, `H`=NTLM at 9, `L`=OEM workstation
-at 13, and so on), and every value in the enum matches. `ClientFlags` correctly
-encodes to `0xE2088207`.
+### Settled
+
+`NtlmFlags` values were suspected and cleared: MS-NLMP 2.2.2.5 labels the bits
+(`W`=56-bit at 31, `H`=NTLM at 9, `L`=OEM workstation at 13) and every declared
+value matches.
+
+SPNEGO wrapping was suspected and cleared. sspi's own documentation on
+`ClientMode` states it directly: *"mstsc and other RDP clients send plain NTLM
+messages (without SPNEGO wrappers) inside CredSSP when Kerberos is not
+possible."* Its reference `TSRequest` test vector begins with a bare `NTLMSSP`
+signature inside `negoToken`, confirming it.
 
 ### Investigation
 

@@ -1,0 +1,37 @@
+[package]
+name = "rdpshot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# The facade crate is versioned independently of its sub-crates: ironrdp is 0.17
+# while ironrdp-connector and ironrdp-blocking are 0.10. The upstream example
+# imports the connector as `connector`, so it is aliased rather than editing it.
+ironrdp = { version = "0.17.0", features = ["connector", "session"] }
+connector = { package = "ironrdp-connector", version = "0.10" }
+ironrdp-blocking = "0.10"
+ironrdp-graphics = "0.9"
+ironrdp-pdu = "0.9.0"
+
+anyhow = "1"
+image = "0.25"
+pico-args = "0.4"
+rand = "0.8"
+
+# The version ironrdp-connector pins. Do not downgrade: sspi 0.10 requires
+# picky 7.0.0-rc.4 while ironrdp-connector requires rc.25, and they conflict.
+# network_client is required: the NetworkClient trait takes a private
+# NetworkRequest, so it cannot be implemented outside the crate.
+sspi = { version = "0.21", features = ["network_client"] }
+
+tokio-rustls = "0.26"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+x509-cert = "0.2"
+
+[[bin]]
+name = "rdpshot"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 2

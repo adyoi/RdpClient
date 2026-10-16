@@ -34,12 +34,24 @@ public class CredSspTests
         //   NegoDataItem ::= SEQUENCE    -> 30 07 a0 05 04 03 de ad be
         //   NegoData ::= SEQUENCE OF     -> 30 09 30 07 a0 05 04 03 de ad be
         //   negoTokens [1]                -> a1 0b <above>
-        //   version [0] INTEGER 6        -> a0 01 06
-        //   TSRequest ::= SEQUENCE        -> 30 10 a0 01 06 a1 0b ...
+        //   version [0] { INTEGER 6 }    -> a0 03 02 01 06
+        //   TSRequest ::= SEQUENCE        -> 30 12 a0 03 02 01 06 a1 0b ...
         byte[] actual = CredSsp.BuildRequest([token]);
 
-        Assert.Equal("3010a00106a10b30093007a00504 03deadbe".Replace(" ", ""),
+        Assert.Equal("3012a003020106a10b30093007a0050403deadbe",
                      Convert.ToHexString(actual).ToLowerInvariant());
+    }
+
+    [Fact]
+    public void BuildRequest_WrapsTheVersionInAnIntegerTagNotBareContentOctets()
+    {
+        // The [0] field must carry a complete INTEGER TLV. Emitting a0 01 06
+        // declares a single content byte holding a bare 0x06, which is not a
+        // valid INTEGER, so the whole request stops being valid DER. The
+        // reference encoding in sspi's own test vector begins a0 03 02 01 06.
+        byte[] actual = CredSsp.BuildRequest();
+
+        Assert.Equal("3005a003020106", Convert.ToHexString(actual).ToLowerInvariant());
     }
 
     [Fact]
@@ -47,11 +59,11 @@ public class CredSspTests
     {
         // errorCode is [4] and is client-originated only on the error path, so
         // the nonce occupies [5]. Getting this wrong shifts every later field.
-        // clientNonce [5] OCTET STRING -> a5 04 04 02 aa bb, so the outer
-        // length is 3 + 6 = 9.
+        // clientNonce [5] OCTET STRING -> a5 04 04 02 aa bb, and version
+        // [0] { INTEGER 6 } -> a0 03 02 01 06, so the outer length is 5 + 6 = 11.
         byte[] actual = CredSsp.BuildRequest(clientNonce: FromHex("aabb"));
 
-        Assert.Equal("3009a00106a5040402aabb", Convert.ToHexString(actual).ToLowerInvariant());
+        Assert.Equal("300ba003020106a5040402aabb", Convert.ToHexString(actual).ToLowerInvariant());
     }
 
     [Fact]
@@ -61,10 +73,10 @@ public class CredSspTests
 
         // A 200-byte token grows the encoding past 127 bytes at every level, so
         // each length must cross to the long form (0x81 nn) rather than wrap.
-        // Sizes nest outwards: 203, 206, 209, 212, then 3 + 215 = 218.
+        // Sizes nest outwards: 203, 206, 209, 212, then 5 + 215 = 220.
         Assert.Equal(0x30, actual[0]);
         Assert.Equal(0x81, actual[1]);
-        Assert.Equal(218, actual[2]);
+        Assert.Equal(220, actual[2]);
     }
 
     [Fact]

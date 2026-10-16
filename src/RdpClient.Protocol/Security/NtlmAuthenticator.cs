@@ -59,11 +59,10 @@ public sealed class NtlmAuthenticator
         ArgumentNullException.ThrowIfNull(channel);
 
         // 1. NEGOTIATE, inside a TSRequest.
-        // Two layers, both required: CredSSP carries the message in a TSRequest
-        // (MS-CSSP 2.2.1) and negotiates through the SSPI "Negotiate" package,
-        // so the NTLM message itself travels inside a SPNEGO token. Dropping
-        // either one is rejected as SEC_E_INVALID_TOKEN (0x80090308).
-        byte[] negotiate = Spnego.BuildNegotiateToken(Ntlm.BuildNegotiateMessage());
+        // CredSSP performs its own mechanism negotiation, so the NTLM message
+        // travels bare in negoToken. SPNEGO is only added for Kerberos; the
+        // reference implementation uses NTLM directly here.
+        byte[] negotiate = Ntlm.BuildNegotiateMessage(_workstation);
         await WriteRequestAsync(channel, [negotiate], cancellationToken).ConfigureAwait(false);
 
         // 2. The server answers with a TSRequest carrying the CHALLENGE.
@@ -74,6 +73,8 @@ public sealed class NtlmAuthenticator
         CredSsp.TryThrowServerError(challengeReply);
 
         byte[] challengeToken = SingleNegoToken(challengeReply, "NTLM challenge");
+        _trace?.Invoke($"<- {Ntlm.DescribeType(challengeToken)} ({challengeToken.Length} bytes)");
+        _trace?.Invoke($"   {Convert.ToHexString(challengeToken).ToLowerInvariant()}");
         var challenge = Ntlm.ParseChallengeMessage(challengeToken);
 
         // 3. Compute NTLMv2 and send the AUTHENTICATE message.
@@ -98,10 +99,7 @@ public sealed class NtlmAuthenticator
             challenge.Flags & NtlmFlags.NegotiateUnicode,
             challenge.ServerChallenge.Span);
 
-        await WriteRequestAsync(
-            channel,
-            [Spnego.BuildAuthenticateToken(authenticate)],
-            cancellationToken).ConfigureAwait(false);
+        await WriteRequestAsync(channel, [authenticate], cancellationToken).ConfigureAwait(false);
 
         // 4. Final request: success, or the NTSTATUS the server reports.
         CredSsp.Request result = await ReadRequestAsync(channel, cancellationToken).ConfigureAwait(false);

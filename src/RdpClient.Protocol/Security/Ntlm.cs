@@ -92,6 +92,8 @@ public static class Ntlm
         NtlmFlags.RequestTarget |
         NtlmFlags.NegotiateNtlm |
         NtlmFlags.AlwaysSign |
+        NtlmFlags.NegotiateSign |
+        NtlmFlags.NegotiateSeal |
         NtlmFlags.NegotiateExtendedSessionSecurity |
         NtlmFlags.NegotiateVersion |
         NtlmFlags.Negotiate128 |
@@ -112,19 +114,44 @@ public static class Ntlm
     }
 
     /// <summary>Build an NTLM NEGOTIATE_MESSAGE (MS-NLMP 2.2.1.1).</summary>
-    public static byte[] BuildNegotiateMessage(NtlmFlags? flags = null)
+    public static byte[] BuildNegotiateMessage(string? workstation = null, NtlmFlags? flags = null)
     {
-        var message = new byte[40];
+        // MS-NLMP 2.2.1.1 fixes the header at 32 bytes and, when
+        // NEGOTIATE_VERSION is set, an 8-octet Version, so the payload starts at
+        // offset 40.
+        const int PayloadOffset = 40;
+
+        byte[] workstationBytes = string.IsNullOrEmpty(workstation)
+            ? []
+            : Encoding.Unicode.GetBytes(workstation);
+
+        NtlmFlags effective = flags ?? ClientFlags;
+        if (workstationBytes.Length > 0)
+        {
+            // The flag may only be set when the name is actually present in the
+            // payload; announcing it without the payload is what the server
+            // reads as a malformed NEGOTIATE.
+            effective |= NtlmFlags.NegotiateOemWorkstationSupplied;
+        }
+
+        var message = new byte[PayloadOffset + workstationBytes.Length];
         Signature.CopyTo(message);
         BinaryPrimitivesCompat.WriteUInt32LittleEndian(message.AsSpan(8), NtlmMessageType.Negotiate);
-        BinaryPrimitivesCompat.WriteUInt32LittleEndian(message.AsSpan(12), (uint)(flags ?? ClientFlags));
+        BinaryPrimitivesCompat.WriteUInt32LittleEndian(message.AsSpan(12), (uint)effective);
 
-        // Domain and workstation are empty length-prefixed fields. Each field is
-        // { LenMax(2), Length(2), BufferOffset(2) } starting at offset 16 and
-        // 24 respectively, so the BufferOffset members sit at 20 and 28.
-        BinaryPrimitivesCompat.WriteUInt16LittleEndian(message.AsSpan(20), 40); // domain buffer offset
-        BinaryPrimitivesCompat.WriteUInt16LittleEndian(message.AsSpan(28), 40); // workstation buffer offset
+        // Domain and workstation are { Length(2), MaxLen(2), BufferOffset(2) }
+        // starting at offset 16 and 24, so the BufferOffset members sit at 20
+        // and 28. The domain is always empty; the workstation follows it.
+        BinaryPrimitivesCompat.WriteUInt16LittleEndian(message.AsSpan(16), 0);
+        BinaryPrimitivesCompat.WriteUInt16LittleEndian(message.AsSpan(18), 0);
+        BinaryPrimitivesCompat.WriteUInt16LittleEndian(message.AsSpan(20), PayloadOffset);
+
+        BinaryPrimitivesCompat.WriteUInt16LittleEndian(message.AsSpan(24), (ushort)workstationBytes.Length);
+        BinaryPrimitivesCompat.WriteUInt16LittleEndian(message.AsSpan(26), (ushort)workstationBytes.Length);
+        BinaryPrimitivesCompat.WriteUInt16LittleEndian(message.AsSpan(28), PayloadOffset);
+
         ClientVersion.CopyTo(message.AsSpan(32));
+        workstationBytes.CopyTo(message.AsSpan(PayloadOffset));
         return message;
     }
 
@@ -218,8 +245,8 @@ public static class Ntlm
         var flags = (NtlmFlags)BinaryPrimitivesCompat.ReadUInt32LittleEndian(message.AsSpan(20));
         byte[] serverChallenge = message.AsSpan(24, 8).ToArray();
 
-        (ushort targetLen, ushort targetOffset) = ReadField(message.AsSpan(12));
-        (ushort infoLen, ushort infoOffset) = ReadField(message.AsSpan(40));
+        (ushort targetLen, uint targetOffset) = ReadField(message.AsSpan(12));
+        (ushort infoLen, uint infoOffset) = ReadField(message.AsSpan(40));
 
         return new Challenge(
             serverChallenge,
@@ -228,12 +255,21 @@ public static class Ntlm
             Slice(message, infoOffset, infoLen));
     }
 
-    private static byte[] Slice(byte[] message, ushort offset, ushort length) =>
-        offset + length <= message.Length ? message.AsSpan(offset, length).ToArray() : [];
+    private static byte[] Slice(byte[] message, uint offset, int length) =>
+        offset + (uint)length <= message.Length ? message.AsSpan((int)offset, length).ToArray() : [];
 
-    private static (ushort Length, ushort Offset) ReadField(ReadOnlySpan<byte> field) =>
-        (BinaryPrimitivesCompat.ReadUInt16LittleEndian(field[4..]),
-         BinaryPrimitivesCompat.ReadUInt16LittleEndian(field[6..]));
+    /// <summary>Read a <c>{ Len, MaxLen, Offset }</c> field descriptor.</summary>
+    /// <remarks>
+    /// The descriptor is Length(2), MaxLen(2), BufferOffset(4) - a 32-bit
+    /// offset. Reading Length from <c>[4..6]</c> and Offset from <c>[6..8]</c>
+    /// instead returns the two halves of the offset, which for a CHALLENGE
+    /// yields the offset as the length and zero as the offset. That silently
+    /// hands the caller the front of the message rather than the AV_PAIR blob,
+    /// and the resulting AUTHENTICATE embeds an entire NTLM header.
+    /// </remarks>
+    private static (ushort Length, uint Offset) ReadField(ReadOnlySpan<byte> field) =>
+        (BinaryPrimitivesCompat.ReadUInt16LittleEndian(field[..2]),
+         BinaryPrimitivesCompat.ReadUInt32LittleEndian(field[4..]));
 
     private static void WriteField(Span<byte> destination, ushort maxLength, ushort length, ushort offset)
     {

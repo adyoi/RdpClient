@@ -17,5 +17,8 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\RdpClient.Protocol\RdpClient.Protocol.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <None Include="Fixtures\**" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
 
 </Project>
