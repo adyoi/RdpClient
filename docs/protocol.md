@@ -118,24 +118,77 @@ what this project does.
 
 ## 3. MCS Connect Initial (2.2.1.3.4)
 
-Carried in the same X.224 envelope as the negotiation request.
+Carried in the same X.224 envelope as the negotiation request, but the payload
+is **ASN.1, not a flat TLV**. It is the T.125 structure:
 
 ```text
-ProtocolVersion (1) = 0x03
-RSTransactionId (2)
-Cookie (2)         = 0xA0A0
-ConnectData (variable, 2-byte length prefix)
-    t124 Identifier (1) = 0x01
-    ConferenceName       2-byte length in UTF-16 code units, then UTF-16LE
-    Label (2)            = 0x0001
-ClientNodeId (variable, 2-byte length prefix)
-ClientInfo (variable, 2-byte length prefix)
-    TS_UD_CS_* blocks
+Connect-Initial ::= [APPLICATION 101] IMPLICIT SEQUENCE
+{
+    callingDomainSelector   OCTET STRING  -- 0x01
+    calledDomainSelector    OCTET STRING  -- 0x01
+    upwardFlag              BOOLEAN       -- TRUE, the client is joining
+    targetParameters        DomainParameters
+    minimumParameters       DomainParameters
+    maximumParameters       DomainParameters
+    userData                OCTET STRING  -- the GCC Conference Create Request
+}
 ```
 
-The conference name length counts **characters**, not bytes. `McsCnxn` is seven
-characters and therefore fourteen bytes; encoding that as `6` is a common and
-silently fatal mistake.
+DomainParameters is a SEQUENCE of eight INTEGERs: `maxChannelIds`,
+`maxUserIds`, `maxTokenIds`, `numPriorities`, `minThroughput`, `maxHeight`,
+`maxMCSPDUsize`, `protocolVersion`.
+
+### The tag is split
+
+101 does not fit the five tag bits of one octet, so it is written as all-ones
+followed by the number: **`7f 65`**. A server that rejects the structure names
+the identifier it wanted, which is what identified this defect rather than
+leaving it to guesswork:
+
+```text
+[ERROR] Parsed [ITU-T X.690] Identifier: expected 0x7f65, actual 0x0300
+```
+
+`0x0300` was the TLV this client used to write: tag `0x03`, length `0x00`.
+
+### Connect Response is the mirror image
+
+`[APPLICATION 102]`, so `7f 66`, wrapping `result ENUMERATED`,
+`calledConnectId INTEGER`, `domainParameters` and `userData`.
+
+### The user data is PER-encoded
+
+The GCC Conference Create Request inside `userData` is T.125's ALIGNED variant
+of BASIC-PER, which is neither BER nor a plain TLV:
+
+```text
+00                          From Key: the OBJECT_IDENTIFIER alternative
+05 00 14 7C 00 01           T.124 (02/98) object identifier, six octets
+<PER length>                connectPDU length - client data + 14
+00                          ConnectGCCPDU: conferenceCreateRequest
+08                          selection: userData present
+<PER numeric string>        the conference name, digits only
+00 01                       one set of user data
+C0                          value present, h221NonStandard selected
+00 "Duca"                   the client-to-server H.221 key
+<PER length> <client data>  the TS_UD_CS_* blocks
+```
+
+Two details in that differ from everything else in RDP:
+
+- **The conference name is a numeric string.** Digits pack a pair to an octet,
+  `(d1 << 4) | d2`, with an implied trailing `0` on an odd length, so the name
+  `"1"` is the single octet **`0x10`**, not `0x01`. `McsCnxn` is not a conference
+  name at all: it is the H.221 node label from the older T.125 CCPDU, and
+  encoding it as a numeric string fails at the first non-digit.
+- **PER lengths are not BER lengths.** Under 128 the length is one octet; above
+  it the high bit is set and the whole two-octet value is kept big-endian,
+  rather than the high bit counting the octets that follow the way it does in
+  BER. `WritePerLength` and `BerLength` therefore disagree on purpose.
+
+The response side mirrors it, and carries one more trap: the `connectPDU`
+length in a Conference Create Response **must be ignored**. Servers do not agree
+on what it counts, so a client that trusts it desynchronises.
 
 ## 4. Client data blocks (2.2.1.3.4.1–.5)
 

@@ -21,6 +21,41 @@ found by diffing against a working reference implementation.
 
 ### Fixed
 
+- **The MCS Connect-Initial was encoded as a flat TLV rather than as ASN.1.**
+  It is T.125's `Connect-Initial ::= [APPLICATION 101] IMPLICIT SEQUENCE`,
+  holding two domain selectors, an upward flag, three sets of domain parameters
+  and the user data. 101 does not fit the five tag bits of one octet, so the
+  identifier is written `7f 65`; the TLV this client produced began `03 00`, and
+  xrdp named the difference:
+
+  ```text
+  [ERROR] Parsed [ITU-T X.690] Identifier: expected 0x7f65, actual 0x0300
+  ```
+
+  The user data inside it is the GCC Conference Create Request, encoded with
+  T.125's ALIGNED variant of BASIC-PER rather than as a TLV. `Asn1` now holds
+  the primitives both need, including the two that differ from the rest of RDP:
+  BER INTEGERs are big-endian and sign-padded (`0xFFFF` becomes `00 FF FF`), and
+  a PER length above 127 keeps a two-octet big-endian value with the high bit
+  set instead of counting the octets that follow.
+- **"MCS Connect Response result 3: connection refused" was a misread TPKT
+  octet.** The response was parsed as a TLV starting at offset 0 of the whole
+  TPKT datagram, so the byte read as the MCS result was `0x03` - the TPKT
+  version. No server in this repository ever refused anything there. Two further
+  errors sat behind it: the Connect-Response is `[APPLICATION 102]` (`7f 66`)
+  and was being matched against nothing, and the X.224 check compared the
+  length indicator against the DT code rather than the code itself.
+- **The conference name was `McsCnxn`.** That is the H.221 node label from the
+  older T.125 CCPDU, not a conference name, and PER encodes the name as a numeric
+  string - digits only, two per octet. The name `"1"` is therefore the octet
+  `0x10`, not `0x01`. The `GccConferenceLabel` constant is removed; nothing in
+  the Connect-Initial carries a label.
+
+  Verified against xrdp 0.10.1, which now parses the Connect-Initial, answers
+  with a Connect-Response assigning UserID 31219, and moves on to the GCC client
+  data - one stage further than before. It rejects those blocks, which is the
+  next thing to fix.
+
 - **`RDP_CORRELATION_INFO` was shorter than the length it declared.** The block
   declares 36 octets but only the 24 named fields were sent. Windows tolerates
   that; xrdp walks the declared length, fails with `Not enough bytes in the

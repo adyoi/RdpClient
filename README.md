@@ -60,10 +60,10 @@ verified against a live server. Everything after channel join is not.
 | --- | --- | --- |
 | X.224 / T.125 connection request | — | **Done** |
 | RDP Negotiation (`RDP_NEG_REQ` / `RDP_NEG_RSP`) | 2.2.1.1 | **Done** |
-| MCS Connect Initial / Connect Response | 2.2.1.3.4, 2.2.1.3.5 | **Done** |
-| GCC Conference Create Request / Response | 2.2.1.3.2, 2.2.1.3.3 | **Done** |
-| `TS_UD_CS_CORE` / `SECURITY` / `NET` / `CLUSTER` / `USER` | 2.2.1.3.4.1–.5 | **Done** |
-| Erect Domain, Attach User, Channel Join | 2.2.1.3.6–.8 | **Done** |
+| MCS Connect Initial / Connect Response | 2.2.1.3.4, 2.2.1.3.5 | **Verified against xrdp** |
+| GCC Conference Create Request / Response | 2.2.1.3.2, 2.2.1.3.3 | **Verified against xrdp** |
+| `TS_UD_CS_CORE` / `SECURITY` / `NET` / `CLUSTER` / `USER` | 2.2.1.3.4.1–.5 | Written; xrdp rejects them |
+| Erect Domain, Attach User, Channel Join | 2.2.1.3.6–.8 | Sent; replies not read yet |
 | RSA key exchange, RC4 / AES session keys | 2.2.1.4.3, 5.3.2 | Not started |
 | TLS handshake for the External Security Protocol | MS-RDPEA 3.1.5.1 | **Works** (verified) |
 | CredSSP / NLA — SPNEGO + NTLM | MS-NLMP, MS-RDPEA | Incomplete |
@@ -72,10 +72,17 @@ verified against a live server. Everything after channel join is not.
 | Keyboard and pointer input | 2.2.8 | Not started |
 | Virtual channel data (clipboard, drive, audio) | 2.2.6 | Not started |
 
-A modern host negotiates successfully, completes TLS, and then selects CredSSP.
-The client stops there and says why. It does not send an MCS Connect Initial it
-knows the server will reject. See [the changelog](CHANGELOG.md) for exactly what
-is verified and what is not.
+Against a **Windows** host the client negotiates, completes TLS, and is then
+selected for CredSSP, which authenticates with NTLM - not implemented yet. The
+client stops there and says why. Windows also refuses `PROTOCOL_SSL` on its own
+with failure code 5, `SSL_REQUIRED_BY_SERVER`, because it wants NLA, so that host
+cannot exercise anything past TLS.
+
+Against **xrdp** the client goes further: the MCS Connect-Initial is accepted,
+the Connect-Response comes back and is parsed, and the client reports the user id
+the server assigned (31219). xrdp then rejects the `TS_UD_CS_*` client data
+blocks, which is the next defect. See [the changelog](CHANGELOG.md) for exactly
+what is verified and what is not.
 
 ### What stands between this and the login screen
 
@@ -160,30 +167,42 @@ without the GUI:
 dotnet run --project src/RdpClient.Cli -- --host 192.0.2.10 --port 3389
 ```
 
-Actual output against a Windows host with NLA enabled:
+Against a **Windows** host with NLA enabled, negotiation and TLS both complete
+and the client then stops where the unimplemented part begins:
 
 ```text
-RdpClient protocol probe -> 127.0.0.1:3389
-protocol core: RdpClient.Protocol 1.0.0.0
+18:44:17.885  info    negotiated version 0x00000008, SelectedProtocol 0x00000008
+18:44:17.886  info    External Security Protocol: CredSSP (TLS + SPNEGO/NTLM)
+18:44:17.886  info    starting TLS handshake, SNI 'TERMSRV/127.0.0.1'
+18:44:17.958  info    Tls13, subject 'CN=runnervm0xl3a' issued by 'CN=runnervm0xl3a'
+18:44:17.958  error   the server selected CredSSP, which authenticates with NTLM,
+                      but no user name was supplied
 
-07:12:02.589  info    resolving 127.0.0.1...
-07:12:02.612  info    connecting to 127.0.0.1:3389...
-07:12:02.622  info    TCP established to 127.0.0.1:3389
-07:12:02.624  info    sent X.224 Connection Request (43 bytes)
-07:12:02.632  info    negotiated version 0x00000008, SelectedProtocol 0x00000008; correlation NOT echoed
-07:12:02.632  error   server selected HYBRID_EX, which requires the CredSSP/NLA handshake
-                      (TLS + SPNEGO + NTLM). That handshake is not implemented, so the
-                      MCS layer cannot start.
-
-RESULT: failed - server selected HYBRID_EX, ...
+RESULT: failed - the server selected CredSSP, ...
 ```
 
-**That stop is the honest current state.** Negotiation completes and is verified
-against a real host; the run then ends because a modern host selects CredSSP. Add
-`--hex` to dump transmitted PDUs, or `--no-correlation` to send the minimal
-19-byte request.
+`--tls-only` is refused by that host with negotiation failure code 5,
+`SSL_REQUIRED_BY_SERVER`, because it wants NLA. So a Windows host cannot be used
+to check anything past TLS.
 
-The harness never prints the password, and reads it from `RDP_PASSWORD` when one is needed.
+Against **xrdp** (`--tls-only`, port 3390) the client gets through MCS, which is
+what makes that server worth having:
+
+```text
+18:44:52.822  info    sent MCS Connect Initial (137 bytes)
+18:44:53.229  info    MCS accepted (conference 0), UserID 31219, ServerNodeID 31219
+18:44:53.229  info    sent Erect Domain Request (8 bytes)
+18:44:53.229  info    sent Attach User Request, UserID 1001
+18:44:53.230  info    joined MCS global channel 1007
+
+RESULT: MCS channel joined.
+```
+
+xrdp accepts the Connect-Initial and then rejects the `TS_UD_CS_*` client data
+blocks inside it, logging
+`Not enough bytes in the stream: expected 32764, remaining 308`. That is the next
+defect, and it is the reason the MCS rows above are marked "verified against
+xrdp" rather than "done".
 
 ## Project layout
 
@@ -194,6 +213,7 @@ src/
     Rdp.cs                Constants transcribed from MS-RDPBCGR
     Negotiation.cs        X.224 / T.125 and RDP_NEG_REQ / RDP_NEG_RSP
     Mcs.cs                Connect Initial/Response, Erect Domain, Attach User, join
+    Asn1.cs               BER and PER primitives; big-endian integers, split tags
     ClientPdu.cs          TS_UD_CS_CORE / SECURITY / NET / CLUSTER / USER
     RdpConnection.cs      Connection sequencing over TCP
   RdpClient/            WinUI 3 front end (Windows only)

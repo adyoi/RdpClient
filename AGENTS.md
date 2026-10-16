@@ -47,13 +47,20 @@ exists for IntelliSense; everything non-obvious is documented at the member.
 | TLS handshake | MS-RDPEA 3.1.5.1 | Verified, TLS 1.2 and 1.3 |
 | CredSSP `TSRequest` envelope | MS-CSSP 2.2.1 | **Encoded and verified structurally**; host now parses it |
 | SPNEGO + NTLM | MS-NLMP | **Not working**, host returns `SEC_E_INVALID_TOKEN` |
-| MCS Connect Initial / Response | 2.2.1.3.4, 2.2.1.3.5 | Written, unreachable |
+| MCS Connect Initial / Response | 2.2.1.3.4, 2.2.1.3.5 | **Verified against xrdp**; reaches the GCC client data |
+| GCC client data (`TS_UD_CS_*`) | 2.2.1.3.4.1 | xrdp rejects the blocks the client builds today |
 | RSA key exchange, session keys, MCS encryption | 5.3.2 | Not started |
 | Capability exchange | 2.2.7 | Not started |
 | Graphics and input | 2.2.8, 2.2.9 | Not started |
 
 Do not describe this as a working remote desktop client. It reaches TLS and
 authenticates nothing.
+
+Windows refuses `PROTOCOL_SSL` alone with failure code 5,
+`SSL_REQUIRED_BY_SERVER`, because it wants NLA. So the Windows host cannot
+exercise the MCS stage at all until NTLM works - **xrdp is the only server that
+can currently verify anything past TLS.** That is worth remembering before
+concluding that a change is fine because Windows tolerates it.
 
 ## Ask the server what it thinks
 
@@ -96,20 +103,36 @@ reason `docs/protocol.md` exists; read it before touching an encoder.
 4. **`NET`, `CLUSTER` and `USER` carry a 6-byte TLV header**: type(2),
    flags(2), length(2). `CORE` has no TLV header and two fixed-width
    NUL-padded fields.
-5. **The GCC conference name length counts UTF-16 code units, not bytes.**
-   `McsCnxn` is 7 characters and 14 bytes.
-6. **MCS integers are plain fixed-width values.** There are no T.125
-   PerEncoding selector bits in RDP; a width-aware writer and reader are used
-   instead.
-7. **A CredSSP `TSRequest` field declared `[n] INTEGER` wraps a whole INTEGER
+5. **The MCS Connect-Initial is ASN.1, not a flat TLV.** It is
+   `Connect-Initial ::= [APPLICATION 101] IMPLICIT SEQUENCE` carrying two domain
+   selectors, an upward flag, three sets of domain parameters and the user data.
+   101 does not fit the five tag bits of one octet, so the identifier is
+   **`7f 65`**. Writing it as a length-prefixed TLV gets `expected 0x7f65,
+   actual 0x0300` out of xrdp - which is how the mistake was found.
+6. **The conference name inside it is a PER numeric string, digits only.**
+   Two digits pack to an octet, `(d1 << 4) | d2`, with an implied trailing `0`
+   on an odd length, so the name `"1"` is the octet **`0x10`** and not `0x01`.
+   `McsCnxn` is not a conference name: it is the H.221 node label from the older
+   T.125 CCPDU, and it cannot be encoded as a numeric string at all.
+7. **A PER length is not a BER length.** Under 128 it is one octet. Above it the
+   high bit is set and the full two-octet value is kept big-endian, rather than
+   the high bit counting the octets that follow the way BER does. In a
+   Conference Create Response the `connectPDU` length must be **ignored
+   entirely** - servers disagree on what it counts.
+8. **Skip the TPKT header before parsing the X.224 envelope.** Reading at
+   offset 0 of a TPKT datagram takes `0x03`, the TPKT version, as if it were the
+   MCS result. That is the origin of a whole family of phantom
+   "connection refused" reports. The X.224 Data TPDU is length indicator, DT
+   code, EOT - so the DT code is the *second* octet.
+9. **A CredSSP `TSRequest` field declared `[n] INTEGER` wraps a whole INTEGER
    TLV.** `version` is `a0 03 02 01 06`, not `a0 01 06`. The second declares one
    content byte holding a bare `0x06`, which is not a valid INTEGER, so the
    whole request stops being valid DER.
-8. **An NTLM field descriptor is `{ Length(2), MaxLen(2), BufferOffset(4) }`.**
+10. **An NTLM field descriptor is `{ Length(2), MaxLen(2), BufferOffset(4) }`.**
    The offset is 32-bit. Reading Length from `[4..6]` and Offset from `[6..8]`
    takes the two halves of the offset instead, which silently yields the offset
    as the length and zero as the offset.
-9. **A structure must be as long as the length field it declares.** The NTLM
+11. **A structure must be as long as the length field it declares.** The NTLM
    `BufferOffset` above is 4 octets and had to be written as 4. Likewise
    `RDP_CORRELATION_INFO` declares 36 while its named fields occupy 24, so the
    block is padded. xrdp walks the declared length and aborts with
