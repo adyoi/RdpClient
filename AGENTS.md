@@ -15,11 +15,24 @@ code or by disassembling `mstsc.exe`.
 ## Build and test
 
 ```powershell
-dotnet build                 # whole solution
-dotnet test                  # protocol tests, must be green before committing
-dotnet build -p:Platform=x64 # also ARM64 and x86
-winapp run                   # launch the WinUI app from src/RdpClient
+dotnet build                                      # whole solution, Debug
+dotnet test                                       # protocol tests, must be green
+winapp run                                        # launch the WinUI app from src/RdpClient
 ```
+
+Shipping binaries. **Publish per runtime, not per solution platform**:
+`RdpClient.slnx` declares no platform configurations, so `-p:Platform=x64`
+fails with `MSB4126`.
+
+```powershell
+dotnet publish src/RdpClient.Cli\RdpClient.Cli.csproj -c Release -r win-x64 --self-contained true -o artifacts\rdpprobe\win-x64
+dotnet publish src\RdpClient\RdpClient.csproj       -c Release -r win-x64 --self-contained true -o artifacts\app\win-x64
+```
+
+`--self-contained` is **required** for the WinUI app. It sets `RuntimeIdentifier`
+without `SelfContained`, and Release enables `PublishTrimmed`, so a plain
+`dotnet build RdpClient.slnx -c Release` fails with `NETSDK1102`. Use
+`win-x64`, `win-arm64` or `win-x86`.
 
 `RdpClient.Protocol` compiles with `TreatWarningsAsErrors`. Fix warnings rather
 than widening `NoWarn`. `CS1591` is already suppressed because the XML doc file

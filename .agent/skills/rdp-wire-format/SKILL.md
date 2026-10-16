@@ -10,6 +10,22 @@ description: >-
 
 # RDP wire format work
 
+## Building
+
+Publish per runtime, never per solution platform:
+
+```powershell
+dotnet test                                       # 69 tests, must be green first
+dotnet publish src/RdpClient.Cli\RdpClient.Cli.csproj -c Release -r win-x64 --self-contained true -o artifacts\rdpprobe\win-x64
+dotnet publish src\RdpClient\RdpClient.csproj       -c Release -r win-x64 --self-contained true -o artifacts\app\win-x64
+```
+
+Two traps: `RdpClient.slnx` declares no platform configurations, so
+`-p:Platform=x64` fails with `MSB4126`; and the WinUI app sets
+`RuntimeIdentifier` without `SelfContained` while Release enables
+`PublishTrimmed`, so a plain `dotnet build RdpClient.slnx -c Release` fails
+with `NETSDK1102`. `--self-contained` is required.
+
 ## The loop that works
 
 Do not derive bytes from memory and do not trust a spec example that does not
