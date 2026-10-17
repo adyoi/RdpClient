@@ -336,10 +336,9 @@ public static class Mcs
         ReadOnlySpan<byte> g = data;
 
         // From Key choice (1), then the T.124 object identifier (a one-octet
-        // length followed by five octets, so six in total), then the connectPDU
-        // length that must be ignored. Counting the identifier as five octets
-        // leaves the cursor one short and reads the user id from the wrong
-        // place.
+        // length followed by five octets, so six in total). Counting the
+        // identifier as five octets leaves the cursor one short and reads the
+        // user id from the wrong place.
         int cursor = 1 + 6;
         if (g.Length < cursor + 1)
         {
@@ -347,7 +346,17 @@ public static class Mcs
             return false;
         }
 
-        cursor++;                                          // the ignored length
+        // The connectPDU length is ignored, but it still occupies one or two
+        // octets. Stepping over a fixed single octet desynchronises the cursor
+        // whenever a server writes the two-octet form, and every field after it
+        // is then read from the wrong offset.
+        if (!Asn1.TryReadPerLength(g[cursor..], out _, out int ignoredSize) || ignoredSize == 0)
+        {
+            problem = "truncated before the ConnectGCCPDU choice";
+            return false;
+        }
+
+        cursor += ignoredSize;
         if (g.Length < cursor + 1)
         {
             problem = "truncated before the ConnectGCCPDU choice";
@@ -355,86 +364,260 @@ public static class Mcs
         }
 
         cursor++;                                          // ConnectGCCPDU choice
-
         if (g.Length < cursor + 2)
         {
-            problem = "truncated before the user id";
+            problem = "truncated before the node id";
             return false;
         }
 
+        // nodeID, a PER integer relative to the base channel id.
         userId = (ushort)(((g[cursor] << 8) | g[cursor + 1]) + Rdp.McsUserChannelBase);
         nodeId = userId;
-        cursor += 2;
 
         return true;
     }
 
-    /// <summary>Build an MCS Erect Domain Request (MS-RDPBCGR 2.2.1.3.6.1).</summary>
-    public static byte[] BuildErectDomainRequest(ushort initiator, params ushort[] domainIds)
+    /// <summary>Build an MCS Erect Domain Request (MS-RDPBCGR 2.2.1.3.5).</summary>
+    /// <remarks>
+    /// <para>
+    /// Wrapped in TPKT and an X.224 Data TPDU. Every MCS domain PDU the client
+    /// sends after the Connect Initial travels in that envelope; only the
+    /// Connect Initial itself is framed differently, because it is an
+    /// [APPLICATION 101] structure rather than a DomainMCSPDU choice.
+    /// </para>
+    /// <para>
+    /// The two trailing fields are subHeight and subInterval, both PER-encoded
+    /// INTEGERs. A PER integer carries its own length determinant, so a zero is
+    /// the two octets <c>01 00</c> and not a bare <c>00</c> - writing the value
+    /// alone leaves the reader one octet short.
+    /// </para>
+    /// </remarks>
+    public static byte[] BuildErectDomainRequest() =>
+        BuildDomainPdu(
+            Rdp.McsOpcode(Rdp.McsChoiceErectDomainRequest),
+            [0x01, 0x00,   // subHeight = 0, as a PER length plus its value
+             0x01, 0x00]); // subInterval = 0
+
+    /// <summary>Build an MCS Attach User Request (MS-RDPBCGR 2.2.1.3.7.1.1).</summary>
+    /// <remarks>
+    /// The PDU has no fields of its own: T.125 puts the assigned user id in the
+    /// server's Attach User Confirm, not in the request. The only octets are
+    /// the DomainMCSPDU choice.
+    /// </remarks>
+    public static byte[] BuildAttachUserRequest() =>
+        BuildDomainPdu(Rdp.McsOpcode(Rdp.McsChoiceAttachUserRequest), []);
+
+    /// <summary>Build an MCS Channel Join Request (MS-RDPBCGR 2.2.1.3.8.1.1).</summary>
+    /// <param name="userId">
+    /// The user id the server assigned in its Attach User Confirm. It is a PER
+    /// INTEGER relative to the MCS base channel id of 1001, so 1001 itself is
+    /// written as <c>00 00</c>. A conventional 1001 is not a substitute: the
+    /// server rejects a join request whose initiator is not the user it
+    /// attached.
+    /// </param>
+    /// <param name="channelId">The channel to join, conventionally 1007.</param>
+    public static byte[] BuildChannelJoinRequest(ushort userId, ushort channelId)
     {
-        var w = new ByteWriter(16 + domainIds.Length * 2);
-        w.U8(Rdp.McsErectDomainRequestPdu);
-        w.U8(0); // initiator is declared but always sent as zero
-        w.U16(initiator);
-        w.U16((ushort)domainIds.Length);
-        foreach (ushort id in domainIds)
+        if (userId < Rdp.McsUserChannelBase)
         {
-            w.U16(id);
+            throw new ArgumentOutOfRangeException(
+                nameof(userId), userId,
+                $"a dynamic channel id must be at least {Rdp.McsUserChannelBase}");
         }
 
-        return w.ToArray();
-    }
-
-    /// <summary>Build an MCS Attach User Request (MS-RDPBCGR 2.2.1.3.7).</summary>
-    public static byte[] BuildAttachUserRequest(ushort initiator, ushort userId)
-    {
-        var w = new ByteWriter(8);
-        w.U8(Rdp.McsAttachUserRequestPdu);
-        w.U8(0);
-        w.U16(initiator);
-        w.U16(userId);
-        return w.ToArray();
-    }
-
-    /// <summary>Build an MCS Channel Join Request (MS-RDPBCGR 2.2.1.3.8).</summary>
-    public static byte[] BuildChannelJoinRequest(ushort initiator, ushort channelId, ushort userId)
-    {
-        var w = new ByteWriter(10);
-        w.U8(Rdp.McsChannelJoinRequestPdu);
-        w.U8(0);
-        w.U16(initiator);
-        w.U16(channelId);
-        w.U16(userId);
-        return w.ToArray();
+        var payload = new ByteWriter(6);
+        payload.U16BigEndian(userId - Rdp.McsUserChannelBase);   // initiator, PER-relative
+        payload.U16BigEndian(channelId);
+        return BuildDomainPdu(Rdp.McsOpcode(Rdp.McsChoiceChannelJoinRequest), payload.ToArray());
     }
 
     /// <summary>
-    /// Wrap a server data PDU in an MCS Send Data Indication.
+    /// Frame a DomainMCSPDU: TPKT header, X.224 Data TPDU, then the opcode.
+    /// </summary>
+    /// <param name="opcode">
+    /// The choice octet, from <see cref="Rdp.McsOpcode"/>. The top six bits are
+    /// the DomainMCSPDU choice and the low two are the option bits.
+    /// </param>
+    /// <param name="payload">The fields that follow the opcode.</param>
+    private static byte[] BuildDomainPdu(byte opcode, byte[] payload)
+    {
+        // TPKT(4) + X.224 Data TPDU(3) + opcode(1) + payload
+        var x224 = new ByteWriter(payload.Length + 4);
+        x224.U8(2);                       // length indicator: the LI octet and the DT code
+        x224.U8(Rdp.X224Data);
+        x224.U8(0x80);                    // EOT, TPDU-NR 0
+        x224.U8(opcode);
+        x224.Bytes(payload);
+        return Negotiation.Tpkt(x224.ToArray());
+    }
+
+    public sealed record DomainPdu(byte Opcode, int Choice, byte[] Payload, byte[] Raw);
+
+    /// <summary>
+    /// Read one DomainMCSPDU: TPKT header, X.224 Data TPDU, then the opcode.
     /// </summary>
     /// <remarks>
-    /// The frame is sent in 1600-byte chunks, each carrying up to 1598 bytes of
-    /// payload after the 2-byte fragmentation length.
+    /// The choice index is the opcode's top six bits. Reading the opcode as the
+    /// choice without the shift is why the whole DomainMCSPDU set was once
+    /// misidentified.
     /// </remarks>
-    public static IReadOnlyList<byte[]> BuildSendDataRequest(
-        ushort initiator, ushort channelId, byte[] payload, int chunkSize = 1598)
+    public static DomainPdu ParseDomainPdu(byte[] buffer)
     {
+        ArgumentNullException.ThrowIfNull(buffer);
+
+        var r = new ByteReader(buffer);
+        int version = r.U8();
+        r.Skip(1);                                   // TPKT reserved
+        int length = r.U16BigEndian();
+
+        if (version != Rdp.TpktVersion)
+        {
+            throw new InvalidDataException($"unexpected TPKT version {version}");
+        }
+
+        if (length != buffer.Length)
+        {
+            throw new InvalidDataException(
+                $"TPKT length {length} disagrees with the {buffer.Length} bytes received");
+        }
+
+        r.Skip(3);                                   // length indicator, DT code, EOT
+        byte opcode = r.U8();
+
+        return new DomainPdu(opcode, opcode >> 2, r.PeekRest().ToArray(), buffer);
+    }
+
+    /// <summary>
+    /// Parse an Attach User Confirm (MS-RDPBCGR 2.2.1.3.7).
+    /// </summary>
+    /// <remarks>
+    /// Returns the assigned user id, which is the value the Channel Join Request
+    /// must carry: a conventional 1001 is not a substitute, because the server
+    /// rejects a join whose initiator is not the user it attached. It is null
+    /// when the server refused.
+    /// <para>
+    /// The id arrives as a PER integer relative to the base channel id, so it is
+    /// read as big-endian with 1001 added back.
+    /// </para>
+    /// </remarks>
+    /// <param name="buffer">One TPKT-framed DomainMCSPDU.</param>
+    /// <param name="expectedResult">The MCS result that means success, normally 0.</param>
+    public static (bool Success, ushort? UserId, string Summary) ParseAttachUserConfirm(
+        byte[] buffer, int expectedResult = 0)
+    {
+        var pdu = ParseDomainPdu(buffer);
+        if (pdu.Choice != Rdp.McsChoiceAttachUserConfirm)
+        {
+            return (false, null,
+                $"expected an Attach User Confirm (choice {Rdp.McsChoiceAttachUserConfirm}), "
+                + $"got choice {pdu.Choice}");
+        }
+
+        var r = new ByteReader(pdu.Payload);
+        byte result = r.U8();
+        if (result != expectedResult)
+        {
+            return (false, null, $"MCS refused the attach: result {result}");
+        }
+
+        // T.125 declares the initiator OPTIONAL and the opcode's low bit is what
+        // says whether it is present. A server that omits it attached nobody by
+        // name, and there is then no id to join a channel with.
+        if ((pdu.Opcode & 0x02) == 0 || r.Remaining < 2)
+        {
+            return (false, null, "the Attach User Confirm carried no user id");
+        }
+
+        ushort assigned = (ushort)(r.U16BigEndian() + Rdp.McsUserChannelBase);
+        return (true, assigned, $"attached as MCS user {assigned}");
+    }
+
+    /// <summary>
+    /// Parse a Channel Join Confirm (MS-RDPBCGR 2.2.1.3.9.1).
+    /// </summary>
+    /// <param name="buffer">One TPKT-framed DomainMCSPDU.</param>
+    /// <param name="expectedResult">The MCS result that means success, normally 0.</param>
+    public static (bool Success, ushort? ChannelId, string Summary) ParseChannelJoinConfirm(
+        byte[] buffer, int expectedResult = 0)
+    {
+        var pdu = ParseDomainPdu(buffer);
+        if (pdu.Choice != Rdp.McsChoiceChannelJoinConfirm)
+        {
+            return (false, null,
+                $"expected a Channel Join Confirm (choice {Rdp.McsChoiceChannelJoinConfirm}), "
+                + $"got choice {pdu.Choice}");
+        }
+
+        var r = new ByteReader(pdu.Payload);
+        byte result = r.U8();
+        if (result != expectedResult)
+        {
+            return (false, null, $"MCS refused the channel join: result {result}");
+        }
+
+        r.Skip(2);                                   // initiator
+        r.U16BigEndian();                            // requested channel id
+        if (r.Remaining < 2)
+        {
+            return (true, null, "the Channel Join Confirm carried no channel id");
+        }
+
+        ushort channel = r.U16BigEndian();
+        return (true, channel, $"joined MCS channel {channel}");
+    }
+
+    /// <summary>
+    /// Wrap a server data PDU in an MCS Send Data Request, chunked.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A Send Data Request is a DomainMCSPDU like the three above, so it carries
+    /// the same TPKT and X.224 Data TPDU envelope and the same choice-shifted
+    /// opcode. A frame without that framing is not an MCS PDU at all.
+    /// </para>
+    /// <para>
+    /// The frame is chunked at 1598 bytes of payload, which is what leaves the
+    /// resulting PDU inside the 1600-byte maximum an MCS domain declares.
+    /// </para>
+    /// </remarks>
+    /// <param name="userId">The initiator, as a dynamic channel id (>= 1001).</param>
+    /// <param name="channelId">The channel to send on.</param>
+    /// <param name="payload">The bytes to send. Must not be empty.</param>
+    /// <param name="chunkSize">Payload bytes per frame, 1598 by default.</param>
+    public static IReadOnlyList<byte[]> BuildSendDataRequest(
+        ushort userId, ushort channelId, byte[] payload, int chunkSize = 1598)
+    {
+        ArgumentNullException.ThrowIfNull(payload);
+
         if (payload.Length == 0)
         {
             throw new ArgumentException("payload must not be empty", nameof(payload));
+        }
+
+        if (userId < Rdp.McsUserChannelBase)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(userId), userId,
+                $"a dynamic channel id must be at least {Rdp.McsUserChannelBase}");
+        }
+
+        if (chunkSize <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(chunkSize), chunkSize, "chunk size must be positive");
         }
 
         var frames = new List<byte[]>();
         for (int offset = 0; offset < payload.Length; offset += chunkSize)
         {
             int length = Math.Min(chunkSize, payload.Length - offset);
+
             var w = new ByteWriter(length + 12);
-            w.U8(Rdp.McsSendDataRequestPdu);
-            w.U8(0);
-            w.U16(initiator);
-            w.U16(channelId);
-            w.U16((ushort)(length + 2));
+            w.U16BigEndian(userId - Rdp.McsUserChannelBase);   // initiator, PER-relative
+            w.U16BigEndian(channelId);
+            w.U8(0x70);                                        // dataPriority low, no segmentation
+            w.U16((ushort)(length + 2));                       // lengthPerFragment, including itself
             w.Bytes(payload.AsSpan(offset, length));
-            frames.Add(w.ToArray());
+            frames.Add(BuildDomainPdu(Rdp.McsOpcode(Rdp.McsChoiceSendDataRequest), w.ToArray()));
         }
 
         return frames;

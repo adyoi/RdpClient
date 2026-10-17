@@ -77,12 +77,43 @@ public static class Rdp
     public const byte McsUdConnectResponse = 0x7e;
     public const byte McsUdDisconnectProviderUltimatum = 0x7d;
 
-    public const byte McsErectDomainRequestPdu = 0x05;
-    public const byte McsAttachUserRequestPdu = 0x06;
-    public const byte McsChannelJoinRequestPdu = 0x07;
-    public const byte McsSendDataRequestPdu = 0x0a;
+    // DomainMCSPDU choice values (T.125 section 8). These are the numbers of
+    // the CHOICE alternatives, NOT the octets that go on the wire: the octet is
+    // the choice shifted left by two with the two dataPriority/segmentation
+    // option bits in the low positions, because the CHOICE index occupies the
+    // top six bits of that octet.
+    //
+    //   opcode = (choice << 2) | options
+    //
+    // MS-RDPBCGR 3.3.5.2 lists a different numbering (5, 6, 7, 10) which counts
+    // from plumbDomainIndication and is the source of the wrong values this
+    // file used to carry. xrdp reports the choice index it read as
+    // "choice index %d", so the shift is checkable against its log.
+    public const int McsChoiceErectDomainRequest = 1;
+    public const int McsChoiceAttachUserRequest = 10;
+    public const int McsChoiceAttachUserConfirm = 11;
+    public const int McsChoiceChannelJoinRequest = 14;
+    public const int McsChoiceChannelJoinConfirm = 15;
+    public const int McsChoiceDisconnectProviderUltimatum = 8;
+    public const int McsChoiceSendDataRequest = 25;
 
-    public const ushort McsGlobalChannel = 1007;
+    /// <summary>Turn a DomainMCSPDU choice into the octet that carries it.</summary>
+    /// <param name="choice">One of the <c>McsChoice*</c> values.</param>
+    /// <param name="options">The two option bits, normally zero.</param>
+    public static byte McsOpcode(int choice, int options = 0) =>
+        (byte)((choice << 2) | (options & 0x03));
+
+    /// <summary>
+    /// The MCS global channel, 1003 (T.125 section 7.6, MS-RDPBCGR 2.2.1.3.8).
+    /// </summary>
+    /// <remarks>
+    /// 1007 is the H.225.0 RTP channel number and appears in some non-RDP
+    /// material. xrdp defines this as <c>MCS_GLOBAL_CHANNEL 1003</c>, so a client
+    /// that joins 1007 is joining a channel no server created.
+    /// </remarks>
+    public const ushort McsGlobalChannel = 1003;
+
+    /// <summary>Lowest dynamic channel id, the base every MCS UserId is offset from.</summary>
     public const ushort McsUserChannelBase = 1001;
 
     /// <summary>
