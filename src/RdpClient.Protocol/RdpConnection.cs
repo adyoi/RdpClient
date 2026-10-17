@@ -20,6 +20,7 @@ public enum HandshakeStage
     DomainErected,
     UserAttached,
     ChannelJoined,
+    ClientInfoSent,
     CapabilityExchanged,
     ActiveConfirmed,
     Complete,
@@ -380,12 +381,31 @@ public sealed class RdpConnection : IAsyncDisposable
                 await JoinChannelsAsync(assigned, channelCount, cancellationToken).ConfigureAwait(false);
             }
 
+            // --- 2.2.1.11 Client Info PDU: the Secure Settings Exchange ---
+            //
+            // The connection sequence places this PDU between the channel joins
+            // and the Demand Active, and the Demand Active genuinely waits on
+            // it. xrdp_sec_recv returns -1 ("send demand active") only in its
+            // SEC_INFO_PKT branch, and libxrdp_process_data turns that code
+            // into the Demand Active. Omitting this PDU stalled the handshake
+            // after the joins with a silent server log, both with the joins and
+            // without them - measured, not guessed, which is also how the two
+            // earlier readings of that stall were proven wrong: it was never a
+            // channel-join count problem, and SKIP_CHANNELJOIN does not fix it.
+            ClientPdu.UserOptions logon = options.User ?? new ClientPdu.UserOptions();
+            byte[] infoPdu = ClientInfo.BuildClientInfoPdu(logon);
+            await SendOnGlobalChannelAsync(assigned, infoPdu, cancellationToken).ConfigureAwait(false);
+            Report(HandshakeStage.ClientInfoSent,
+                $"sent Client Info PDU ({infoPdu.Length} bytes) on the global channel; "
+                + "logon fields are not logged");
+
             // --- 2.2.1.13 Mandatory capability exchange ---
             //
-            // The server now asks for capabilities with a Demand Active PDU and
-            // will not send anything further until a Confirm Active comes back.
-            // Reading it is also the first proof that the channel joins landed:
-            // the server only gets here once its expected joins have arrived.
+            // Between the Client Info PDU and the Demand Active the server
+            // sends its Licensing PDU, which ReadDemandActiveAsync skips by
+            // structure. Reading the Demand Active is the first proof that the
+            // whole Secure Settings Exchange landed: the server only reaches
+            // this step once it has parsed the logon fields.
             Capability.DemandActive demand = await ReadDemandActiveAsync(cancellationToken)
                 .ConfigureAwait(false);
             Report(HandshakeStage.CapabilityExchanged,
@@ -399,8 +419,8 @@ public sealed class RdpConnection : IAsyncDisposable
                 $"answered with {Capability.DescribeCapabilitySets(
                     Capability.ParseCapabilitySets(
                         confirmActive,
-                        Capability.ShareControlHeaderSize + 4 + 2 + 2 + 2 + 4,
-                        confirmActive.Length - Capability.ShareControlHeaderSize - 4 - 2 - 2 - 2 - 4))} "
+                        Capability.ConfirmActiveSetsOffset,
+                        confirmActive.Length - Capability.ConfirmActiveSetsOffset))} "
                 + $"in {confirmActive.Length} bytes");
 
             Report(HandshakeStage.Complete,
@@ -573,6 +593,31 @@ public sealed class RdpConnection : IAsyncDisposable
                     + $"the server used {indication.ChannelId}");
             }
 
+            // 2.2.1.12: between the Client Info PDU and the Demand Active the
+            // server answers with its Licensing PDU. It has a security header
+            // flags word of its own and no Share Control Header, and the
+            // demand-active exchange continues only once it is out of the way -
+            // xrdp sends it from xrdp_sec_send_lic_response, as the second
+            // thing that reader's branch does, before the send-demand-active
+            // error code pops. It is skipped by its own message size, and not
+            // appended to the demand-active buffer that reassembly reads.
+            if (buffer.Length == 0
+                && ClientInfo.IsLicensePdu(indication.Payload, out int licenseLength))
+            {
+                if (licenseLength > indication.Payload.Length)
+                {
+                    throw new RdpProtocolException(
+                        $"the server's Licensing PDU needs {licenseLength} octets "
+                        + $"but its MCS fragment carried {indication.Payload.Length}; "
+                        + "split licensing PDUs are not handled");
+                }
+
+                Report(HandshakeStage.ClientInfoSent,
+                    "server answered with a Server Licensing PDU "
+                    + $"({licenseLength} bytes); waiting for the Demand Active PDU");
+                continue;
+            }
+
             buffer.Write(indication.Payload, 0, indication.Payload.Length);
 
             if (indication.Segmentation is Mcs.SegmentationLast or Mcs.SegmentationSingle)
@@ -675,7 +720,8 @@ public sealed class RdpConnection : IAsyncDisposable
         HandshakeStage.McsAccepted => "the MCS Connect Initial",
         HandshakeStage.DomainErected => "the Erect Domain Request",
         HandshakeStage.UserAttached => "the Attach User Confirm",
-        HandshakeStage.ChannelJoined => "the channel joins; it never sent the Demand Active PDU",
+        HandshakeStage.ChannelJoined => "the channel joins",
+        HandshakeStage.ClientInfoSent => "the Client Info PDU; it never sent the Demand Active PDU",
         HandshakeStage.CapabilityExchanged => "the capability sets it demanded",
         HandshakeStage.ActiveConfirmed => "the Confirm Active PDU",
         _ => stage.ToString(),

@@ -692,14 +692,26 @@ public static class Mcs
         // segmentation field decides whether more fragments follow.
         byte segmentation = (byte)((dataPriority >> 5) & 0x03);
 
-        int fragmentLength = r.U16();
-        if (fragmentLength < 2)
+        // [ITU-T T.125] userData carries an [ITU-T X.691] length determinant
+        // (11.9.3.6-3.8) in both directions, exactly as xrdp parses it before
+        // handing the payload to the security layer: one octet at or below 127,
+        // otherwise two octets big-endian with the leading 0x8x marker, the
+        // value being the octets of userData that follow. It is not a
+        // little-endian count that includes its own field: a plain u16 here
+        // shifted every following byte once, xrdp then read the stray octet as
+        // part of its security header and mistook the PDU for a Security
+        // Exchange packet.
+        byte lengthByte = r.U8();
+        if ((lengthByte & 0xC0) == 0xC0)
         {
             throw new InvalidDataException(
-                $"a Send Data Indication fragment length must cover its own field, got {fragmentLength}");
+                "a Send Data Indication fragment above 16K octets is not supported");
         }
 
-        int dataLength = fragmentLength - 2;
+        int dataLength = (lengthByte & 0xC0) == 0x80
+            ? (((lengthByte & 0x3F) << 8) | r.U8())
+            : lengthByte;
+
         if (r.Remaining < dataLength)
         {
             throw new InvalidDataException(
@@ -759,7 +771,23 @@ public static class Mcs
             w.U16BigEndian(userId - Rdp.McsUserChannelBase);   // initiator, PER-relative
             w.U16BigEndian(channelId);
             w.U8(0x70);                                        // dataPriority low, no segmentation
-            w.U16((ushort)(length + 2));                       // lengthPerFragment, including itself
+
+            // [ITU-T T.125] SendDataRequest.userData is qualified by an
+            // [ITU-T X.691] length determinant, one octet at or below 127 and
+            // otherwise two big-endian octets with the 0x8x marker, the value
+            // counting only the octets that follow. xrdp's sender encodes it
+            // just this way in xrdp_mcs_send, and its receiver steps the field
+            // by the same rule; a plain u16 little-endian here desynchronized
+            // its whole parse and read back as a Security Exchange PDU.
+            if (length >= 0x80)
+            {
+                w.U16BigEndian((ushort)(0x8000 | length));
+            }
+            else
+            {
+                w.U8(length);
+            }
+
             w.Bytes(payload.AsSpan(offset, length));
             frames.Add(BuildDomainPdu(Rdp.McsOpcode(Rdp.McsChoiceSendDataRequest), w.ToArray()));
         }

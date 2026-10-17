@@ -799,19 +799,27 @@ public class McsTests
     }
 
     /// <summary>
-    /// The Share Control Header packs the PDU type into the top two bits.
+    /// The pduType field keeps the PDU type in its four least significant bits,
+    /// with PDUVersion above them: a Demand Active encodes 0x0011 on the wire.
     /// </summary>
+    /// <remarks>
+    /// MS-RDPBCGR 2.2.8.1.1.1.1 packs it as <c>(type | (TS_PROTOCOL_VERSION
+    /// &lt;&lt; 4))</c> with TS_PROTOCOL_VERSION 0x1; xrdp reads it back with
+    /// <c>pdu_code &amp; 0xf</c> and FreeRDP writes <c>type | 0x10</c>. The
+    /// earlier type-in-the-top-bits packing mistook every real Demand Active
+    /// for "type 0" and put bytes no peer speaks on the wire.
+    /// </remarks>
     [Theory]
-    [InlineData(1, 0x1001)]   // Demand Active
-    [InlineData(3, 0x3001)]   // Confirm Active
-    public void ShareControlHeader_PacksTheTypeIntoItsTopBits(int pduType, int expectedPduType2)
+    [InlineData(1, 0x11)]   // Demand Active
+    [InlineData(3, 0x13)]   // Confirm Active
+    public void ShareControlHeader_EncodesTheTypeInItsLeastSignificantBits(int pduType, int expectedPduType)
     {
-        byte[] header = Capability.BuildShareControlHeader(pduType, 0, totalLength: 0x2e);
+        byte[] header = Capability.BuildShareControlHeader(pduType, totalLength: 0x2e);
 
         Assert.Equal(6, header.Length);
-        Assert.Equal(0x2e, header[0] | (header[1] << 8));              // totalLength
-        Assert.Equal(expectedPduType2, header[2] | (header[3] << 8));  // pduType2
-        Assert.Equal(0, header[4] | (header[5] << 8));                // pduType1, reserved
+        Assert.Equal(0x2e, header[0] | (header[1] << 8));               // totalLength
+        Assert.Equal(expectedPduType, header[2] | (header[3] << 8));    // pduType
+        Assert.Equal(Rdp.McsGlobalChannel, header[4] | (header[5] << 8)); // pduSource
 
         var parsed = Capability.ParseShareControlHeader(header);
         Assert.Equal(pduType, parsed.PduType);
@@ -843,8 +851,8 @@ public class McsTests
         // General set(24) sessionId(4) = 46 octets.
         byte[] pdu = Convert.FromHexString(
             "2e00" +     // totalLength 46
-            "0110" +     // pduType2: Demand Active, protocol version 1
-            "0000" +     // pduType1
+            "1100" +     // pduType: Demand Active (1) | PDUVersion 0x1 << 4
+            "eb03" +     // pduSource 1003
             "34120000" + // shareID 0x1234
             "0000" +     // lengthSourceDescriptor 0
             "1c00" +     // lengthCombinedCapabilities 28 = 4 + 24
@@ -871,7 +879,7 @@ public class McsTests
     public void ParseDemandActive_RejectsACountThatDoesNotMatchTheSets()
     {
         byte[] pdu = Convert.FromHexString(
-            "2e00" + "0110" + "0000" + "34120000" + "0000" + "1c00" +
+            "2e00" + "1100" + "0000" + "34120000" + "0000" + "1c00" +
             "0200" +     // claims two capability sets
             "0000" +
             "010018000100030000020000000000000000000000000000" +
@@ -883,14 +891,14 @@ public class McsTests
 
     /// <summary>
     /// The Confirm Active PDU is a Confirm Active header, the server channel as
-    /// originator, and nothing but the capabilities.
+    /// originator, the T.128 "RDP" source descriptor, and the capability sets.
     /// </summary>
     [Fact]
     public void BuildConfirmActivePdu_CarriesTheServerChannelAsItsOriginator()
     {
         byte[] pdu = Capability.BuildConfirmActivePdu(shareId: 0x1234, [Capability.BuildGeneralCapabilitySet()]);
 
-        Assert.Equal(6 + 4 + 2 + 2 + 2 + 4 + 24, pdu.Length);
+        Assert.Equal(Capability.ConfirmActiveSetsOffset + 24, pdu.Length);
 
         var header = Capability.ParseShareControlHeader(pdu);
         Assert.Equal(Capability.PduTypeConfirmActive, header.PduType);
@@ -898,19 +906,27 @@ public class McsTests
 
         Assert.Equal(0x1234, pdu[6] | (pdu[7] << 8) | (pdu[8] << 16) | (pdu[9] << 24)); // shareID
         Assert.Equal(1002, pdu[10] | (pdu[11] << 8));                                   // originatorID
-        Assert.Equal(0, pdu[12] | (pdu[13] << 8));                                     // lengthSourceDescriptor
+        Assert.Equal(Capability.SourceDescriptorLength, pdu[12] | (pdu[13] << 8));      // lengthSourceDescriptor
         Assert.Equal(28, pdu[14] | (pdu[15] << 8));                                    // lengthCombinedCapabilities
-        Assert.Equal(1, pdu[16] | (pdu[17] << 8));                                     // numberCapabilities
+        Assert.Equal("52445000", Convert.ToHexString(pdu, 16, 4).ToLowerInvariant());   // sourceDescriptor "RDP\0"
+        Assert.Equal(1, pdu[20] | (pdu[21] << 8));                                     // numberCapabilities
     }
 
     /// <summary>
     /// A Send Data Indication is how every server PDU after the joins arrives.
     /// </summary>
+    /// <remarks>
+    /// The userData length behind the 0x70 octet is an [ITU-T X.691] length
+    /// determinant, one plain octet here because 8 octets sit below 128. The
+    /// earlier synthetic frame wrote a little-endian u16 "including itself";
+    /// nothing on the wire speaks that encoding, and it was corrected together
+    /// with the sender after xrdp read the stray octet as its security header.
+    /// </remarks>
     [Fact]
     public void SendDataIndication_ReadsTheChannelAndTheFragmentation()
     {
-        // 03 00 00 17 | 02 f0 80 | 68 | 0001 | 03eb | 70 | 0a00 | 8 octets
-        byte[] indication = Convert.FromHexString("0300001702f08068000103eb700a000011223344556677");
+        // 03 00 00 16 | 02 f0 80 | 68 | 0001 | 03eb | 70 | 08 | 8 octets
+        byte[] indication = Convert.FromHexString("0300001602f08068000103eb70080011223344556677");
 
         var parsed = Mcs.ParseSendDataIndication(indication);
 
@@ -921,18 +937,42 @@ public class McsTests
     }
 
     /// <summary>
+    /// Fragments above 127 octets arrive in the two-octet 0x8x length form.
+    /// </summary>
+    [Fact]
+    public void SendDataIndication_ReadsTheTwoOctetLengthForm()
+    {
+        // Length 300 = 0x012C -> determinant 0x8128 + 0x2C, then 300 octets. The
+        // TPKT length covers the whole frame: 4 + 3 + 1 + 2 + 2 + 1 + 2 + 300
+        // = 315 = 0x13B.
+        var payload = new byte[300];
+        payload[0] = 0xAB;
+        var frame = new List<byte>
+        {
+            0x03, 0x00, 0x01, 0x3B, 0x02, 0xF0, 0x80, 0x68, 0x00, 0x01, 0x03, 0xEB, 0x70, 0x81, 0x2C,
+        };
+        frame.AddRange(payload);
+
+        var parsed = Mcs.ParseSendDataIndication(frame.ToArray());
+
+        Assert.Equal((ushort)1003, parsed.ChannelId);
+        Assert.Equal(300, parsed.Payload.Length);
+        Assert.Equal(0xAB, parsed.Payload[0]);
+    }
+
+    /// <summary>
     /// A Send Data Indication that claims more data than it carries is malformed.
     /// </summary>
     [Fact]
     public void SendDataIndication_RejectsAFragmentLengthBeyondThePDU()
     {
-        // Declares a 10-octet fragment, so 8 octets of data, but carries 2. The TPKT
-        // length is consistent on purpose, so the failure comes from the fragment
-        // length rather than from the envelope.
-        byte[] indication = Convert.FromHexString("0300001102f08068000103eb700a000011");
+        // Declares a 16-octet fragment in the single-octet form, but carries 2.
+        // The TPKT length is consistent on purpose, so the failure comes from
+        // the fragment length rather than from the envelope.
+        byte[] indication = Convert.FromHexString("0300001002f08068000103eb70100011");
 
         var ex = Assert.Throws<InvalidDataException>(() => Mcs.ParseSendDataIndication(indication));
-        Assert.Contains("declares a 8-octet fragment but only 2", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("declares a 16-octet fragment but only 2", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -942,18 +982,57 @@ public class McsTests
         var frames = Mcs.BuildSendDataRequest(1004, Rdp.McsGlobalChannel, payload);
 
         Assert.Equal(4, frames.Count);   // 1598 + 1598 + 1598 + 206
+        int offset = 0;
         foreach (byte[] frame in frames)
         {
             // Every frame must be a complete TPKT datagram, not a bare MCS PDU.
             Mcs.DomainPdu pdu = Mcs.ParseDomainPdu(frame);
             Assert.Equal(Rdp.McsChoiceSendDataRequest, pdu.Choice);
 
+            int chunkLength = Math.Min(1598, payload.Length - offset);
+            offset += chunkLength;
+
             var r = new ByteReader(pdu.Payload);
             Assert.Equal(3u, r.U16BigEndian());                 // initiator - 1001
             Assert.Equal((uint)Rdp.McsGlobalChannel, r.U16BigEndian());
             r.U8();                                              // dataPriority/segmentation
-            Assert.True(r.U16BigEndian() > 2);
+
+            // The length is an [ITU-T X.691] determinant, matching the octets
+            // that actually follow in this frame.
+            byte lengthByte = r.U8();
+            int declared = (lengthByte & 0xC0) == 0x80
+                ? (((lengthByte & 0x3F) << 8) | r.U8())
+                : lengthByte;
+            Assert.Equal(chunkLength, declared);
         }
+    }
+
+    /// <summary>
+    /// The length determinant switches between its one- and two-octet forms at
+    /// the 128-octet boundary.
+    /// </summary>
+    /// <remarks>
+    /// [ITU-T X.691] 11.9.3.6-11.9.3.7, as xrdp's sender applies it in both
+    /// directions. The 128-byte edge is a real one: a payload of 127 or fewer
+    /// octets must stay one octet long, or a strict reader counts one too many.
+    /// </remarks>
+    [Fact]
+    public void SendDataRequest_KeepsTheLengthDeterminantShortBelow128Octets()
+    {
+        byte[] small = Mcs.BuildSendDataRequest(1004, Rdp.McsGlobalChannel, new byte[127])[0];
+        byte[] edge = Mcs.BuildSendDataRequest(1004, Rdp.McsGlobalChannel, new byte[128])[0];
+
+        var smallPdu = Mcs.ParseDomainPdu(small);
+        var r = new ByteReader(smallPdu.Payload);
+        r.Skip(5);                                        // initiator, channel, priority
+        Assert.Equal(127, r.U8());                        // single plain octet
+
+        var edgePdu = Mcs.ParseDomainPdu(edge);
+        var e = new ByteReader(edgePdu.Payload);
+        e.Skip(5);
+        byte first = e.U8();
+        Assert.Equal(0x80, first & 0xC0);                 // two octets, 0x8x marker
+        Assert.Equal(128, ((first & 0x3F) << 8) | e.U8());
     }
 
     [Fact]
@@ -1012,5 +1091,168 @@ public class ByteCodecTests
         {
             Assert.Equal((uint)i, r.U32());
         }
+    }
+}
+
+/// <summary>
+/// The Client Info PDU (MS-RDPBCGR 2.2.1.11) and the licensing skip it needs.
+/// </summary>
+/// <remarks>
+/// The layout is pinned by field, not by value: the PDU carries credentials, so
+/// the test inputs are synthetic and the assertions point at fixed offsets with
+/// their spec numbers. This is the PDU whose absence stalled the handshake
+/// after the channel joins; if its layout shifts, xrdp answers with
+/// "received wrong flags" and the Demand Active never comes.
+/// </remarks>
+public class ClientInfoTests
+{
+    /// <summary>
+    /// Overall length with an empty domain, "jane" as the user, "pw" as the
+    /// password and empty shell and working dir: header + info packet strings
+    /// + the extended info block, per the offsets the members assert.
+    /// </summary>
+    public const int ExpectedTotalLength = 270;
+
+    private static readonly byte[] JaneUtf16 =
+        System.Text.Encoding.Unicode.GetBytes("jane");
+
+    [Fact]
+    public void ClientInfoPdu_FieldOffsetsFollowTheSpec()
+    {
+        byte[] pdu = ClientInfo.BuildClientInfoPdu(new ClientPdu.UserOptions
+        {
+            UserName = "jane",
+            Password = "pw",
+        });
+
+        Assert.Equal(ExpectedTotalLength, pdu.Length);
+
+        // TS_SECURITY_HEADER (2.2.8.1.1.2.1): SEC_INFO_PKT = 0x0040, not the
+        // 0x0080 that reader intuition picks, because that is SEC_LICENSE_PKT.
+        Assert.Equal((byte)0x40, pdu[0]);
+        Assert.Equal((byte)0x00, pdu[1]);
+        Assert.Equal(0, BitConverter.ToInt16(pdu, 2));   // flagsHi
+
+        // CodePage under INFO_UNICODE is a language id, here en-US (0x0409).
+        Assert.Equal(0x0409u, BitConverter.ToUInt32(pdu, 4));
+
+        // flags: the base set xrdp's INFO_LOGON_NORMAL check demands bits of,
+        // plus InfoAutoLogon because a password was given.
+        uint expectedFlags = ClientInfo.DefaultFlags | ClientInfo.InfoAutoLogon;
+        Assert.Equal(expectedFlags, BitConverter.ToUInt32(pdu, 8));
+
+        // The five declared counts exclude the mandatory null terminator.
+        Assert.Equal(0, BitConverter.ToUInt16(pdu, 12)); // cbDomain, empty
+        Assert.Equal(JaneUtf16.Length, BitConverter.ToUInt16(pdu, 14));
+        Assert.Equal(4, BitConverter.ToUInt16(pdu, 16)); // "pw" -> 2 chars * 2
+        Assert.Equal(0, BitConverter.ToUInt16(pdu, 18)); // cbAlternateShell
+        Assert.Equal(0, BitConverter.ToUInt16(pdu, 20)); // cbWorkingDir
+
+        // 22..24 domain terminator, then the user name at 24 and its terminator.
+        Assert.Equal(0, BitConverter.ToUInt16(pdu, 22));
+        Assert.Equal(JaneUtf16, pdu[24..32]);
+        Assert.Equal(0, BitConverter.ToUInt16(pdu, 32));
+        Assert.Equal(System.Text.Encoding.Unicode.GetBytes("pw"), pdu[34..38]);
+        Assert.Equal(0, BitConverter.ToUInt16(pdu, 38));
+        Assert.Equal(0, BitConverter.ToUInt16(pdu, 40)); // shell terminator
+        Assert.Equal(0, BitConverter.ToUInt16(pdu, 42)); // working dir terminator
+
+        // TS_EXTENDED_INFO_PACKET (2.2.1.11.1.1.1). cbClientAddress and
+        // cbClientDir INCLUDE the terminator, unlike the five counts above.
+        Assert.Equal((short)ClientInfo.AddressFamilyInet, BitConverter.ToInt16(pdu, 44));
+        Assert.Equal(2 * (ClientInfo.ClientAddress.Length + 1), BitConverter.ToUInt16(pdu, 46));
+        Assert.Equal(System.Text.Encoding.Unicode.GetBytes(ClientInfo.ClientAddress), pdu[48..66]);
+        Assert.Equal(2 * (ClientInfo.ClientDir.Length + 1), BitConverter.ToUInt16(pdu, 68));
+        Assert.Equal(System.Text.Encoding.Unicode.GetBytes(ClientInfo.ClientDir), pdu[70..88]);
+
+        // UTC: timezone (172), clientSessionId, performanceFlags - all zero.
+        Assert.All(pdu[90..270], b => Assert.Equal(0, b));
+    }
+
+    [Fact]
+    public void ClientInfoPdu_AutoLogonFlagFollowsThePassword()
+    {
+        byte[] withPassword = ClientInfo.BuildClientInfoPdu(new ClientPdu.UserOptions
+        {
+            UserName = "jane",
+            Password = "pw",
+        });
+        byte[] without = ClientInfo.BuildClientInfoPdu(new ClientPdu.UserOptions
+        {
+            UserName = "jane",
+        });
+
+        Assert.Equal(
+            ClientInfo.DefaultFlags | ClientInfo.InfoAutoLogon,
+            BitConverter.ToUInt32(withPassword, 8));
+        Assert.Equal(ClientInfo.DefaultFlags, BitConverter.ToUInt32(without, 8));
+
+        // A packet whose flags request auto logon and whose password field is
+        // empty is refusable server-side: xrdp logs "Client enable auto logon
+        // with credentials, but the client did not...", so the flag owns the
+        // bit only when the password is real.
+        Assert.Equal(0, BitConverter.ToUInt16(without, 16));   // cbPassword
+        Assert.Equal(0, BitConverter.ToUInt16(without, 34));   // password terminator
+    }
+
+    [Fact]
+    public void ClientInfoPdu_RejectsAStringLongerThanTheSpecAllows()
+    {
+        // 2.2.1.11.1.1: maximum 512 bytes including the terminator, so 510
+        // octets of text is the ceiling - 255 characters fit, 256 do not.
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => ClientInfo.BuildClientInfoPdu(new ClientPdu.UserOptions
+            {
+                UserName = new string('a', 256),
+            }));
+        byte[] pdu = ClientInfo.BuildClientInfoPdu(new ClientPdu.UserOptions
+        {
+            UserName = new string('a', 255),
+        });
+        Assert.Equal(510, BitConverter.ToUInt16(pdu, 14));
+    }
+
+    [Fact]
+    public void ClientInfoPdu_KeysOffTheDefaultFlagSet()
+    {
+        // The mask xrdp requires before it will parse the packet at all:
+        // (flags & 0x33) == 0x33, its own INFO_LOGON_NORMAL constant.
+        Assert.Equal(0x33u, ClientInfo.DefaultFlags & 0x33);
+    }
+
+    [Fact]
+    public void LicensePdu_IsRecognizedAndSkippedByItsOwnSize()
+    {
+        // The structure xrdp writes in xrdp_sec_send_lic_response: a basic
+        // security header carrying SEC_LICENSE_PKT | SEC_LICENSE_ENCRYPT_CS
+        // flagsHi zero, then the 16-octet valid-client message.
+        var w = new ByteWriter(4 + 16);
+        w.U16(ClientInfo.SecLicensePkt | 0x0200);
+        w.U16(0);
+        w.U8(0xFF);        // LICENSE_PREAMBLE bMsgType (ERROR_ALERT)
+        w.U8(0x03);        // bVersion
+        w.U16(16);         // wMessageSize, counting the preamble
+        w.U32(0);          // dwErrorCode
+        w.U32(0);          // dwStateTransition
+        w.U16(0);          // wBlobType
+        w.U16(0);          // wBlobLen
+        var payload = w.ToArray();
+
+        Assert.True(ClientInfo.IsLicensePdu(payload, out int totalLength));
+        Assert.Equal(4 + 16, totalLength);
+    }
+
+    [Fact]
+    public void LicensePdu_DoesNotMistakeAShareControlHeaderForItself()
+    {
+        // A Share Control Header whose totalLength is 0x0280 has the same first
+        // two bytes as the licensing flag word. Its third field is pduType2,
+        // which is never zero, while a licensing security header's flagsHi is.
+        var lookalike = new byte[] { 0x80, 0x02, 0x11, 0x00 };
+        Assert.False(ClientInfo.IsLicensePdu(lookalike, out _));
+
+        // And a real Client Info PDU is not a licensing PDU either.
+        byte[] info = ClientInfo.BuildClientInfoPdu(new ClientPdu.UserOptions());
+        Assert.False(ClientInfo.IsLicensePdu(info, out _));
     }
 }

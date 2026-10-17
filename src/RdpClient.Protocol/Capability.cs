@@ -13,15 +13,37 @@ namespace RdpClient.Protocol;
 /// </remarks>
 public static class Capability
 {
-    // Share Control Header pduType2 values (MS-RDPBCGR 2.2.8.1.1.1.1).
+    // Share Control Header pduType values (MS-RDPBCGR 2.2.8.1.1.1.1).
     public const int PduTypeDemandActive = 1;
     public const int PduTypeConfirmActive = 3;
 
-    /// <summary>TS_PROTOCOL_VERSION, the low twelve bits of pduType2.</summary>
+    /// <summary>
+    /// TS_PROTOCOL_VERSION (MS-RDPBCGR 2.2.1.13.1.1): the value of the 12-bit
+    /// PDUVersion subfield of the pduType field.
+    /// </summary>
     public const int ProtocolVersion = 0x1;
 
-    /// <summary>The Share Control Header is totalLength, pduType2, pduType1.</summary>
+    /// <summary>
+    /// The Share Control Header is totalLength(2), pduType(2), pduSource(2)
+    /// (MS-RDPBCGR 2.2.8.1.1.1.1).
+    /// </summary>
     public const int ShareControlHeaderSize = 6;
+
+    /// <summary>
+    /// The T.128 source descriptor, "RDP" plus its NUL (T128 8.4.1). xrdp
+    /// writes the same four octets in its own Demand Active PDU.
+    /// </summary>
+    public const int SourceDescriptorLength = 4;
+
+    /// <summary>
+    /// Where the capability sets begin in a Confirm Active PDU this class
+    /// builds (TS_CONFIRM_ACTIVE_PDU, MS-RDPBCGR 2.2.1.13.2.1): after the
+    /// Share Control Header, shareID, originatorID, lengthSourceDescriptor,
+    /// lengthCombinedCapabilities, the source descriptor, numberCapabilities
+    /// and pad2Octets.
+    /// </summary>
+    public const int ConfirmActiveSetsOffset =
+        ShareControlHeaderSize + 4 + 2 + 2 + 2 + SourceDescriptorLength + 2 + 2;
 
     /// <summary>CAPSTYPE_GENERAL, from MS-RDPBCGR 2.2.7.1.1.</summary>
     public const ushort CapSetGeneral = Rdp.CapSetGeneral;
@@ -49,15 +71,18 @@ public static class Capability
     /// Build the Share Control Header (MS-RDPBCGR 2.2.8.1.1.1.1).
     /// </summary>
     /// <remarks>
-    /// pduType2 packs the PDU type in its top two bits and the protocol version
-    /// in the rest, which is why a Demand Active header is 0x1 and a Confirm
-    /// Active is 0x3 rather than the raw type number: the layout is
-    /// <c>(pduType &lt;&lt; 12) | (flags &lt;&lt; 10) | pduVersion</c>.
+    /// The pduType field keeps the PDU type in its 4 <c>least</c> significant
+    /// bits with PDUVersion in the 12 bits above them, so the whole field is
+    /// <c>(pduType &amp; 0xF) | (ProtocolVersion &lt;&lt; 4)</c> and a Demand
+    /// Active encodes 0x0011. The field is read back the same way by xrdp
+    /// (<c>pdu_code &amp; 0xf</c> in xrdp_rdp_recv) and written the same way by
+    /// FreeRDP (<c>type | 0x10</c>); packing the type into the top bits
+    /// produced bytes no peer speaks, and reading the top bits mistook every
+    /// real Demand Active for "type 0".
     /// </remarks>
     /// <param name="pduType">One of the <c>PduType*</c> values.</param>
-    /// <param name="flags">The two action bits, normally zero.</param>
     /// <param name="totalLength">Length of the whole PDU, header included.</param>
-    public static byte[] BuildShareControlHeader(int pduType, int flags, int totalLength)
+    public static byte[] BuildShareControlHeader(int pduType, int totalLength)
     {
         if (totalLength > ushort.MaxValue)
         {
@@ -68,8 +93,8 @@ public static class Capability
 
         var w = new ByteWriter(ShareControlHeaderSize);
         w.U16(totalLength);
-        w.U16((pduType << 12) | ((flags & 0x03) << 10) | (ProtocolVersion & 0x03FF));
-        w.U16(0);     // pduType1, reserved
+        w.U16((pduType & 0xF) | (ProtocolVersion << 4));
+        w.U16(Rdp.McsGlobalChannel);  // pduSource - the channel the PDU is sent on
         return w.ToArray();
     }
 
@@ -89,12 +114,22 @@ public static class Capability
         var r = new ByteReader(buffer);
         int totalLength = r.U16();
         int pduType2 = r.U16();
-        r.U16();     // pduType1, reserved
+        r.U16();     // pduSource
+
+        // totalLength 0x8000 signals a T.128 FlowPDU (MS-RDPBCGR 2.2.8.1.1.1.1;
+        // FreeRDP treats it the same way in rdp_read_share_control_header). It
+        // is not a slow-path PDU and its remaining bytes mean nothing here.
+        if (totalLength == 0x8000)
+        {
+            throw new InvalidDataException(
+                "the Share Control Header reads as a FlowPDU (totalLength 0x8000), "
+                + "which carries no slow-path PDU");
+        }
 
         return new ShareControlHeader(
             totalLength,
-            pduType2 >> 12,
-            pduType2 & 0x03FF,
+            pduType2 & 0xF,           // type: 4 least significant bits (2.2.8.1.1.1.1)
+            (pduType2 >> 4) & 0xFFF,  // PDUVersion: TS_PROTOCOL_VERSION = 0x1
             ShareControlHeaderSize);
     }
 
@@ -310,7 +345,8 @@ public static class Capability
     /// The originator ID is fixed at the server channel id 0x03EA (1002) by the
     /// specification, which is a different channel from either the user channel
     /// this client joins or the global channel it sends on: 1002 is the channel
-    /// the server owns.
+    /// the server owns. The set body carries the T.128 source descriptor
+    /// "RDP\0", the same four octets xrdp writes in its own Demand Active.
     /// </remarks>
     /// <param name="shareId">Copied from the Demand Active PDU.</param>
     /// <param name="capabilities">
@@ -332,16 +368,20 @@ public static class Capability
             + 2                                          // originatorID
             + 2                                          // lengthSourceDescriptor
             + 2                                          // lengthCombinedCapabilities
-            + 0                                          // sourceDescriptor, empty
+            + SourceDescriptorLength                     // sourceDescriptor, "RDP\0"
             + 4                                          // numberCapabilities, pad2Octets
             + setsLength;
 
         var w = new ByteWriter(totalLength);
-        w.Bytes(BuildShareControlHeader(PduTypeConfirmActive, 0, totalLength));
+        w.Bytes(BuildShareControlHeader(PduTypeConfirmActive, totalLength));
         w.U32(shareId);
         w.U16(Rdp.McsServerChannel);                    // originatorID, fixed at 1002
-        w.U16(0);                                       // lengthSourceDescriptor
-        w.U16(4 + setsLength);                          // lengthCombinedCapabilities
+        w.U16(SourceDescriptorLength);                  // lengthSourceDescriptor
+        w.U16(2 + 2 + setsLength);                      // lengthCombinedCapabilities
+        w.U8((byte)'R');                                // sourceDescriptor: T.128 "RDP"
+        w.U8((byte)'D');
+        w.U8((byte)'P');
+        w.U8(0);
         w.U16(capabilities.Count);                      // numberCapabilities
         w.U16(0);                                       // pad2Octets
 
