@@ -126,6 +126,16 @@ actually confirmed.
   announces that a message carries TargetInfo and is server-side.
 - `NEGOTIATE_VERSION` was set while the 8-octet Version field at offset 32 was
   left all zero, which is not a valid version.
+- **The GCC `connectPDU` length added a flat 14 octets of overhead.** It counts the
+  client data, twelve octets of fixed framing, **and the client-data length field
+  itself**, and that field is one octet while the client data stays below 0x80. The
+  declared length was therefore one too large for any client data under 128 bytes,
+  which does not occur in a real connection but is wrong. It is now
+  `clientData.Length + 12 + PerLengthOctets(clientData.Length)`. Measured in
+  `mstscax.dll`, which builds it as `(0xe - (uint)(uVar3 < 0x80)) + uVar3` - +14 at
+  or above 0x80 and +13 below - which agrees with that formula at every input,
+  including the narrow band where the total crosses 0x80 while the client data does
+  not.
 
 ### Security
 

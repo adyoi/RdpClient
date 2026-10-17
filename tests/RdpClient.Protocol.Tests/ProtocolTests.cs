@@ -465,9 +465,11 @@ public class McsTests
         Assert.Equal(0x00, conference[5]);
         Assert.Equal(0x01, conference[6]);
 
-        // connectPDU length: the client data plus fourteen octets of framing.
-        // It is small enough here to stay in the one-octet form.
-        Assert.Equal(0x10, conference[7]);
+        // connectPDU length: the two client data octets, twelve of fixed
+        // framing, and the one-octet client-data length. 15, not 16 - this is
+        // the value mstscax.dll writes, and it is one lower than the old
+        // constant of 14 because the length field is a single octet here.
+        Assert.Equal(0x0F, conference[7]);
 
         Assert.Equal(0x00, conference[8]);      // ConnectGCCPDU: conferenceCreateRequest
         Assert.Equal(0x08, conference[9]);      // selection: userData present
@@ -488,6 +490,67 @@ public class McsTests
         Assert.Equal(0xAD, conference[22]);
         Assert.Equal(23, conference.Length);
     }
+
+    /// <summary>
+    /// The connectPDU length counts the client-data length field along with
+    /// the client data and twelve octets of framing.
+    /// </summary>
+    /// <remarks>
+    /// This was a constant 14, which is right only once the client data is
+    /// large enough for its own length to take two octets. Measured in
+    /// mstscax.dll, which builds the value as
+    /// <c>(0xe - (uint)(uVar3 &lt; 0x80)) + uVar3</c>: +14 for a total at or above
+    /// 0x80 and +13 below it. Both agree everywhere, so the declared value
+    /// always describes the octets that follow it.
+    /// </remarks>
+    [Theory]
+    [InlineData(2, 15, 1)]      // one-octet length field
+    [InlineData(100, 113, 1)]
+    [InlineData(114, 127, 1)]   // last client data that still yields a one-octet total
+    [InlineData(115, 128, 2)]   // the total crosses 0x80 although the client data does not
+    [InlineData(127, 140, 2)]
+    [InlineData(200, 214, 2)]
+    [InlineData(4096, 4110, 2)] // a realistic GCC client data size
+    public void ConnectPduLength_CountsItsOwnLengthField(
+        int clientDataLength, int expectedLength, int expectedLengthOctets)
+    {
+        byte[] conference = Mcs.BuildConferenceCreateRequest(new byte[clientDataLength]);
+
+        // The From Key choice, the object identifier and its length, then the
+        // connectPDU length field itself.
+        const int connectPduLengthAt = 7;
+        int connectPduLengthOctets = conference[connectPduLengthAt] > 0x7F ? 2 : 1;
+        Assert.Equal(expectedLengthOctets, connectPduLengthOctets);
+
+        int actual = conference[connectPduLengthAt] > 0x7F
+            ? ((conference[connectPduLengthAt] & 0x7F) << 8) | conference[connectPduLengthAt + 1]
+            : conference[connectPduLengthAt];
+        Assert.Equal(expectedLength, actual);
+
+        // The declared value must describe what actually follows it, whatever
+        // width it ended up taking: everything past the two octets of the
+        // field that holds it.
+        int afterLengthField = connectPduLengthAt + connectPduLengthOctets;
+        Assert.Equal(expectedLength, conference.Length - afterLengthField);
+
+        // The twelve fixed octets that follow are the ConnectGCCPDU choice, the
+        // selection, the conference name length, the name, the padding, the set
+        // count, the UserData choice, and the H.221 key length and key.
+        int clientDataLengthAt = afterLengthField + 12;
+        Assert.Equal(
+            clientDataLength,
+            ReadPerLength(conference, clientDataLengthAt));
+
+        // And the client data must begin where that says it does.
+        int clientDataAt = clientDataLengthAt
+            + (clientDataLength > 0x7F ? 2 : 1);
+        Assert.Equal(clientDataLength, conference.Length - clientDataAt);
+    }
+
+    private static int ReadPerLength(byte[] buffer, int at) =>
+        buffer[at] > 0x7F
+            ? ((buffer[at] & 0x7F) << 8) | buffer[at + 1]
+            : buffer[at];
 
     [Fact]
     public void ConferenceCreateRequest_RejectsANonNumericName()

@@ -15,8 +15,11 @@ public static class Mcs
     /// Build the GCC Conference Create Request (MS-RDPBCGR 2.2.1.3.2).
     /// </summary>
     /// <remarks>
-    /// The conference name length is expressed in UTF-16 code units, not bytes,
-    /// which is the detail most reimplementations get wrong.
+    /// The byte layout was confirmed against <c>mstscax.dll</c>, the COM control
+    /// that holds the RDP client logic, where this structure is assembled as
+    /// immediates rather than as a data table: <c>00 05 00 14 7c 00 01</c>, the
+    /// PER length, <c>00 08 00 10 00 01 c0 00 44 75 63 61</c>, the PER length of
+    /// the client data, then the blocks copied verbatim.
     /// </remarks>
     public static byte[] BuildConferenceCreateRequest(
         byte[] clientData,
@@ -24,6 +27,12 @@ public static class Mcs
     {
         ArgumentNullException.ThrowIfNull(clientData);
         ArgumentNullException.ThrowIfNull(conferenceName);
+
+        // Twelve octets of fixed framing follow the connectPDU length before
+        // the client-data length field: the ConnectGCCPDU choice, the optional
+        // selection, the conference name length and name, the padding, the set
+        // count, the UserData choice, and the H.221 key length and key.
+        const int ConnectPduFixedOverhead = 12;
 
         var w = new ByteWriter(clientData.Length + 32);
 
@@ -39,9 +48,24 @@ public static class Mcs
         w.U8(0x01);
 
         // connectPDU length: everything after this field, which is the client
-        // data plus fourteen octets of framing.
-        const int ConnectPduOverhead = 14;
-        Asn1.WritePerLength(w, clientData.Length + ConnectPduOverhead);
+        // data, twelve octets of fixed framing, and the client-data length
+        // field itself.
+        //
+        // A fixed fourteen is wrong below 0x80, because the length of the
+        // client data is part of what is being counted and takes one octet
+        // there rather than two. Measured in mstscax.dll, which builds this as
+        //
+        //     uVar1 = (0xe - (uint)(uVar3 < 0x80)) + uVar3;
+        //
+        // - that is, +14 for a total at or above 0x80 and +13 below it. The
+        // two agree everywhere, including where the total crosses 0x80 while
+        // the client data does not, so this states it as the width of the
+        // field actually being added.
+        int connectPduLength = clientData.Length
+            + ConnectPduFixedOverhead
+            + Asn1.PerLengthOctets(clientData.Length);
+
+        Asn1.WritePerLength(w, connectPduLength);
 
         // ConnectGCCPDU: conferenceCreateRequest, then its optional userData.
         w.U8(0x00);

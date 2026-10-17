@@ -361,6 +361,16 @@ internal static class Asn1
         }
     }
 
+    /// <summary>How many octets <see cref="WritePerLength"/> emits for a value.</summary>
+    /// <remarks>
+    /// A PER length is one octet up to 127 and two above that, where the high
+    /// bit is set and the whole value is kept. Anything that has to account for
+    /// the width of a length field it is itself writing - the GCC connectPDU
+    /// length counts the field that holds it - needs this to stay
+    /// self-consistent rather than assuming a fixed width.
+    /// </remarks>
+    public static int PerLengthOctets(int length) => length > 0x7F ? 2 : 1;
+
     /// <summary>
     /// A PER numeric string: a length, then each digit pair packed into one
     /// octet, high nibble first.
