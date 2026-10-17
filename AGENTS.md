@@ -119,6 +119,70 @@ Read every Channel Join Confirm and compare the channel it names against the one
 requested. The result octet alone says "success"; the channel id is what proves
 which channel was joined.
 
+## Do not send channel joins at all, unless a server makes you
+
+`RNS_UD_CS_SUPPORT_SKIP_CHANNELJOIN` is `0x0800` in CORE's
+`earlyCapabilityFlags` (MS-RDPBCGR 2.2.1.3.2). It is not an optimisation on top
+of joining. **It replaces joining**, and the flag and the behaviour are set from
+one `RdpConnectionOptions.SkipChannelJoin` property, because they contradict each
+other: announcing the skip and then joining anyway tells the server two
+contradictory things.
+
+**It is off by default, because it did not help.** It was written up here first as
+the way past xrdp and that turned out to be wrong; do not repeat it.
+
+### What xrdp actually does after the Attach User Confirm
+
+xrdp's `handle_channel_join_requests` does a `libxrdp_force_read` *after every
+join*, waiting for whatever comes next:
+
+```c
+expected_join_count = self->channel_list->count + 2;   /* only when the flag is clear */
+while (*appid == MCS_CJRQ)
+{
+    ... read join, send CJCF ...
+    s = libxrdp_force_read(self->iso_layer->trans);    /* blocks for the next PDU */
+    get_domain_mcs_pdu_header(self, s, appid);
+}
+```
+
+But `xrdp_mcs_incoming` returns immediately after sending the Attach User
+Confirm, and the next read is in `libxrdp_process_data`, which also blocks. So
+**both** paths end with xrdp blocked on a read:
+
+| Client sends | Where xrdp blocks |
+| --- | --- |
+| the 10 joins | the `force_read` after the last join, inside the join loop |
+| no joins, flag set | the first `force_read` in `libxrdp_process_data` |
+
+Measured, not predicted: with the flag set the client logged
+`announced RNS_UD_CS_SUPPORT_SKIP_CHANNELJOIN (0800); sent no Channel Join
+Requests` and then waited, and xrdp's log gained nothing at all. xrdp has sent
+no Demand Active PDU under either strategy, so **what a client sends after the
+joins, and why, is still open**. Do not record it as answered.
+
+What *is* settled: the joins themselves are right. Sending all ten clears
+xrdp's entire `ChannelJoinRequest failed` chain and the server logs
+`xrdp_load_keyboard_layout`, which it only does once the MCS sequence completes.
+
+### Bound every handshake
+
+A blocking socket read cannot distinguish a stalled server from a slow one.
+Before `RdpConnectionOptions.Timeout`, this client waited forever and had to be
+killed - the failure looked like a hung process and the server log was clean, so
+there was nothing at all to diagnose. With the timeout the same situation reads:
+
+```text
+error  the server stopped responding after 12s; the last thing that worked was
+       the channel joins; it never sent the Demand Active PDU
+```
+
+That is a reportable failure. Waiting forever is not.
+
+**If you ever send the joins**, the full set is one per static virtual channel
+offered, then the MCS user channel (1001) and the global channel (1003), each
+with its Confirm read and checked.
+
 Windows refuses `PROTOCOL_SSL` alone with failure code 5,
 `SSL_REQUIRED_BY_SERVER`, because it wants NLA. So the Windows host cannot
 exercise the MCS stage at all until NTLM works - **xrdp is the only server that
@@ -228,17 +292,29 @@ reason `docs/protocol.md` exists; read it before touching an encoder.
     `(0xe - (uint)(uVar3 < 0x80)) + uVar3`, which is `12 + width + clientData`.
     Note the corollary: a total that crosses 0x80 while the client data does not
     still takes two octets, so the two widths are not interchangeable.
-17. **Join every channel, not just the global one.** One Channel Join Request per
-    static virtual channel offered, plus the MCS user channel **1001** and the
-    global channel **1003**. Static channel ids are positional at 1004 + N. See
-    [Reading the channel join](#reading-the-channel-join); a client that joins
-    only 1003 produces xrdp's whole `ChannelJoinRequest failed` chain.
+17. **`RNS_UD_CS_SUPPORT_SKIP_CHANNELJOIN` is `0x0800` and replaces the joins,
+    it does not supplement them.** Setting the flag and joining anyway tells the
+    server two contradictory things, so the flag and the behaviour come from one
+    property. It is **off by default here**, because measurement showed xrdp
+    sends no Demand Active PDU under either strategy - see
+    [Do not send channel joins at all](#do-not-send-channel-joins-at-all-unless-a-server-makes-you),
+    which also records that this was first written up as the fix and was wrong.
+    When joins are sent, the full set is one per static virtual channel, plus the
+    MCS user channel **1001** and the global channel **1003**, with static ids
+    positional at 1004 + N.
 18. **The Channel Join Confirm's option bits do not mean what the Attach User
     Confirm's do.** `0x02` marks the *initiator* in the Attach User Confirm and
     the *channel id* in the Channel Join Confirm, where xrdp writes initiator and
     requested unconditionally beside it. Read the channel id only when the bit is
     set, and check it against the channel that was requested - the result octet
     alone will report success for a channel that was never joined.
+19. **A `lengthCapability` counts its own four-octet header,** exactly as a
+    `TS_UD_HEADER` length does. A set that declared only its payload would be
+    read as the next set's type.
+20. **A reassembly loop needs a bound.** Reading a PDU out of MCS fragments until
+    the fragmentation field says the last one has arrived is fine until that
+    field is misread, at which point the read never finishes and there is no
+    diagnostic at all - a parse bug that presents as a hang.
 
 ## Section numbers, and a block that does not exist
 
