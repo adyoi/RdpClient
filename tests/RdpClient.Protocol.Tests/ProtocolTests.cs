@@ -145,35 +145,44 @@ public class NegotiationTests
 
 public class ClientPduTests
 {
+    /// <summary>
+    /// The GCC user data header is four octets: type then length.
+    /// </summary>
+    /// <remarks>
+    /// There is no flags field. Treating the header as type/flags/length shifts
+    /// every payload field by two octets and misreads the type of whatever
+    /// follows, which is how a whole block of settings goes missing without a
+    /// single diagnostic.
+    /// </remarks>
     [Fact]
-    public void NetData_HeaderIsSixteenBitLittleEndian()
+    public void EveryBlockStartsWithAFourOctetUserDataHeader()
     {
-        // Regression: TSFC headers are 16-bit. Writing 0xC003 as one byte yields
-        // 0x03 and shifts every following field by a byte.
-        byte[] net = ClientPdu.BuildNet(ClientPdu.DefaultChannels());
-
-        // 0xC003 little-endian is 03 C0 on the wire.
-        Assert.Equal(0x03, net[0]);
-        Assert.Equal(0xC0, net[1]);
-        Assert.Equal(0x00, net[2]);   // flags, low byte
-        Assert.Equal(0x00, net[3]);   // flags, high byte
-        Assert.Equal(0x08, net[4]);   // length of the fixed portion
-        Assert.Equal(0x00, net[5]);   // length, high byte
+        foreach ((string name, byte[] block, int type) in new (string, byte[], int)[]
+                 {
+                     ("core", ClientPdu.BuildCore(), Rdp.TsUdCsCore),
+                     ("security", ClientPdu.BuildSecurity(), Rdp.TsUdCsSecurity),
+                     ("net", ClientPdu.BuildNet(ClientPdu.DefaultChannels()), Rdp.TsUdCsNet),
+                     ("cluster", ClientPdu.BuildCluster(), Rdp.TsUdCsCluster),
+                 })
+        {
+            Assert.Equal(type, BitConverter.ToUInt16(block, 0));
+            Assert.Equal(block.Length, BitConverter.ToUInt16(block, 2));
+            Assert.True(block.Length >= 4, $"{name} is too short to hold a header");
+        }
     }
 
     [Fact]
-    public void NetData_RejectsChannelNamesLongerThanTheEightByteField()
+    public void CoreData_IsTheTwoHundredAndThirtyFourOctetBlockTheSpecDescribes()
     {
-        Assert.Throws<ArgumentException>(() => ClientPdu.BuildNet([new("toolongname")]));
-    }
+        // 4 header + 4 version + 2 width + 2 height + 2 depth + 2 sas + 4 layout
+        // + 4 build + 32 name + 12 keyboard + 64 ime + 2 postBeta2 + 2 productId
+        // + 4 serial + 2 highDepth + 2 supported + 2 earlyCaps + 64 digProductId
+        // + 1 connectionType + 1 pad + 4 selectedProtocol + 4 physW + 4 physH
+        // + 2 orientation + 4 scale + 4 deviceScale.
+        byte[] core = ClientPdu.BuildCore();
 
-    [Fact]
-    public void NetData_AdvertisesEveryDefaultChannel()
-    {
-        byte[] net = ClientPdu.BuildNet(ClientPdu.DefaultChannels());
-        var reader = new ByteReader(net);
-        reader.Skip(6);                       // type(2) + flags(2) + length(2)
-        Assert.Equal((uint)ClientPdu.DefaultChannels().Count, reader.U32());
+        Assert.Equal(234, core.Length);
+        Assert.Equal(234, BitConverter.ToUInt16(core, 2));
     }
 
     [Fact]
@@ -186,7 +195,48 @@ public class ClientPduTests
         });
 
         // The truncation must not change the total structure length.
-        Assert.Equal(172, core.Length);
+        Assert.Equal(234, core.Length);
+    }
+
+    [Fact]
+    public void SecurityData_IsAFixedTwelveOctetBlock()
+    {
+        // 4 header + 4 encryptionMethods + 4 encryptionLevel.
+        byte[] security = ClientPdu.BuildSecurity();
+
+        Assert.Equal(12, security.Length);
+        Assert.Equal(12, BitConverter.ToUInt16(security, 2));
+    }
+
+    [Fact]
+    public void NetData_LengthIsEightPlusTwelvePerChannel()
+    {
+        // CHANNEL_DEF is a fixed 12 octets: an 8-octet name and a 4-octet options
+        // mask. The header is 4 and channelCount is 4, so the total is 12*N + 8.
+        IReadOnlyList<ClientPdu.VirtualChannelOption> channels = ClientPdu.DefaultChannels();
+
+        byte[] net = ClientPdu.BuildNet(channels);
+
+        Assert.Equal(12 * channels.Count + 8, net.Length);
+        Assert.Equal(net.Length, BitConverter.ToUInt16(net, 2));
+    }
+
+    [Fact]
+    public void NetData_RejectsChannelNamesLongerThanTheEightByteField()
+    {
+        // CHANNEL_DEF::name is a fixed 8-octet field. Silently truncating would
+        // announce one channel to the client log and a different one to the
+        // server.
+        Assert.Throws<ArgumentException>(() => ClientPdu.BuildNet([new("toolongname")]));
+    }
+
+    [Fact]
+    public void NetData_AdvertisesEveryDefaultChannel()
+    {
+        byte[] net = ClientPdu.BuildNet(ClientPdu.DefaultChannels());
+        var reader = new ByteReader(net);
+        reader.Skip(4);                       // type(2) + length(2)
+        Assert.Equal((uint)ClientPdu.DefaultChannels().Count, reader.U32());
     }
 
     [Fact]
@@ -199,11 +249,39 @@ public class ClientPduTests
         });
 
         var reader = new ByteReader(user);
-        reader.Skip(6);        // type(2) + flags(2) + length(2)
+        reader.Skip(4);        // type(2) + length(2)
         reader.U32();          // code page
         reader.U32();          // flags
         Assert.Equal(8, reader.U16());    // CORP -> 4 chars * 2 bytes
         Assert.Equal(10, reader.U16());   // alice -> 5 chars * 2 bytes
+    }
+
+    /// <summary>
+    /// Every block must declare the size of the whole block.
+    /// </summary>
+    /// <remarks>
+    /// MS-RDPBCGR 2.2.1.3.1: the length is "the size in bytes of the data
+    /// block, including this header". A reader walks that length to find the
+    /// next block, so declaring a fixed portion while sending more
+    /// desynchronises every block after it. xrdp walks it as <c>length</c> and
+    /// steps to <c>header + size</c>, and refused the whole GCC user data when
+    /// NET declared 8 and sent 114.
+    /// </remarks>
+    [Theory]
+    [InlineData("net")]
+    [InlineData("cluster")]
+    [InlineData("user")]
+    public void DeclaredLength_CoversTheWholeBlock(string which)
+    {
+        byte[] block = which switch
+        {
+            "net" => ClientPdu.BuildNet(ClientPdu.DefaultChannels()),
+            "cluster" => ClientPdu.BuildCluster(),
+            "user" => ClientPdu.BuildUser(new ClientPdu.UserOptions { UserName = "alice" }),
+            _ => throw new ArgumentException($"unknown block '{which}'", nameof(which)),
+        };
+
+        Assert.Equal(block.Length, BitConverter.ToUInt16(block, 2));
     }
 }
 
@@ -434,48 +512,130 @@ public class McsTests
         Assert.Equal(200 + 14 + 9, conference.Length);
     }
 
-    [Fact]
-    public void ErectDomainRequest_DecaresEachDomainId()
+    /// <summary>
+    /// Pinned to the annotated PDUs MS-RDPBCGR publishes: 4.1.5 (Erect Domain
+    /// Request), 4.1.6 (Attach User Request) and 2.2.1.3.8 (Channel Join
+    /// Request). Each is compared byte for byte, TPKT header included.
+    /// </summary>
+    /// <remarks>
+    /// These three used to be emitted unframed and with the opcode taken as the
+    /// PDU code. The opcode is the DomainMCSPDU CHOICE index in the top six bits
+    /// with the option bits in the low two, so a raw code lands on a different
+    /// PDU entirely and no server accepts it.
+    /// </remarks>
+    [Theory]
+    // 03 00 00 0c | 02 f0 80 | 04 01 00 01 00
+    [InlineData("erect", "0300000c02f0800401000100")]
+    // 03 00 00 08 | 02 f0 80 | 28
+    [InlineData("attach", "0300000802f08028")]
+    public void DomainPdu_MatchesTheAnnotatedExample(string which, string expected)
     {
-        byte[] erect = Mcs.BuildErectDomainRequest(0x03fa, Rdp.McsGlobalChannel);
+        byte[] actual = which switch
+        {
+            "erect" => Mcs.BuildErectDomainRequest(),
+            "attach" => Mcs.BuildAttachUserRequest(),
+            _ => throw new ArgumentException($"unknown PDU '{which}'", nameof(which)),
+        };
 
-        var reader = new ByteReader(erect);
-        Assert.Equal(Rdp.McsErectDomainRequestPdu, reader.U8());
-        reader.U8();
-        reader.U16();
-        Assert.Equal(1, reader.U16());
-        Assert.Equal(Rdp.McsGlobalChannel, reader.U16());
+        Assert.Equal(expected, Convert.ToHexString(actual).ToLowerInvariant());
     }
 
     [Fact]
-    public void ChannelJoinRequest_CarriesInitiatorChannelAndUser()
+    public void ChannelJoinRequest_CarriesTheAssignedUserIdAndTheGlobalChannel()
     {
-        byte[] join = Mcs.BuildChannelJoinRequest(0x03fa, 1007, 1001);
+        // The initiator is the id from the Attach User Confirm, written as a PER
+        // integer relative to 1001, and the global channel is 1003.
+        byte[] join = Mcs.BuildChannelJoinRequest(1004, Rdp.McsGlobalChannel);
 
-        var reader = new ByteReader(join);
-        Assert.Equal(Rdp.McsChannelJoinRequestPdu, reader.U8());
-        reader.U8();
-        Assert.Equal(0x03fa, reader.U16());
-        Assert.Equal(1007, reader.U16());
-        Assert.Equal(1001, reader.U16());
+        Assert.Equal("0300000c02f08038000303eb", Convert.ToHexString(join).ToLowerInvariant());
+
+        Mcs.DomainPdu pdu = Mcs.ParseDomainPdu(join);
+        Assert.Equal(Rdp.McsChoiceChannelJoinRequest, pdu.Choice);
+
+        var r = new ByteReader(pdu.Payload);
+        Assert.Equal(3u, r.U16BigEndian());          // 1004 - 1001
+        Assert.Equal((uint)Rdp.McsGlobalChannel, r.U16BigEndian());
     }
 
     [Fact]
-    public void SendDataRequest_ChunksLargePayloads()
+    public void ChannelJoinRequest_RefusesAUserIdBelowTheMcsBase()
+    {
+        // Below 1001 the PER-relative value would underflow rather than encode.
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => Mcs.BuildChannelJoinRequest(1000, Rdp.McsGlobalChannel));
+    }
+
+    [Fact]
+    public void AttachUserConfirm_YieldsTheUserIdTheJoinMustUse()
+    {
+        // 03 00 00 0b | 02 f0 80 | 2e 00 00 07
+        // 0x2e = (11 << 2) | 2: the choice is 11 and the option bit says the
+        // OPTIONAL initiator is present. 7 + 1001 = 1008.
+        byte[] confirm = Convert.FromHexString("0300000b02f0802e000007");
+
+        var result = Mcs.ParseAttachUserConfirm(confirm);
+
+        Assert.True(result.Success);
+        Assert.Equal((ushort)1008, result.UserId);
+    }
+
+    [Fact]
+    public void AttachUserConfirm_ReportsARefusalRatherThanInventingAnId()
+    {
+        // result 5 is rt-no-such-user in T.125.
+        byte[] confirm = Convert.FromHexString("0300000b02f8802e050007");
+
+        var result = Mcs.ParseAttachUserConfirm(confirm);
+
+        Assert.False(result.Success);
+        Assert.Null(result.UserId);
+        Assert.Contains("result 5", result.Summary, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ChannelJoinConfirm_IsDistinguishedFromTheRequest()
+    {
+        // 03 00 00 0f | 02 f0 80 | 3e 00 00 01 03eb 03eb
+        byte[] confirm = Convert.FromHexString("0300000f02f0803e00000103eb03eb");
+
+        var result = Mcs.ParseChannelJoinConfirm(confirm);
+
+        Assert.True(result.Success);
+        Assert.Equal((ushort)1003, result.ChannelId);
+
+        // Feeding the request to the confirm parser must be an error, not a
+        // silent success: the two differ only in the opcode.
+        Assert.False(Mcs.ParseChannelJoinConfirm(Mcs.BuildErectDomainRequest()).Success);
+    }
+
+    [Fact]
+    public void SendDataRequest_ChunksLargePayloadsInsideTheMcsEnvelope()
     {
         byte[] payload = new byte[5000];
-        var frames = Mcs.BuildSendDataRequest(0x03fa, 1007, payload);
+        var frames = Mcs.BuildSendDataRequest(1004, Rdp.McsGlobalChannel, payload);
 
         Assert.Equal(4, frames.Count);   // 1598 + 1598 + 1598 + 206
         foreach (byte[] frame in frames)
         {
-            var reader = new ByteReader(frame);
-            Assert.Equal(Rdp.McsSendDataRequestPdu, reader.U8());
-            reader.U8();
-            reader.U16();
-            reader.U16();
-            Assert.True(reader.U16() > 2);
+            // Every frame must be a complete TPKT datagram, not a bare MCS PDU.
+            Mcs.DomainPdu pdu = Mcs.ParseDomainPdu(frame);
+            Assert.Equal(Rdp.McsChoiceSendDataRequest, pdu.Choice);
+
+            var r = new ByteReader(pdu.Payload);
+            Assert.Equal(3u, r.U16BigEndian());                 // initiator - 1001
+            Assert.Equal((uint)Rdp.McsGlobalChannel, r.U16BigEndian());
+            r.U8();                                              // dataPriority/segmentation
+            Assert.True(r.U16BigEndian() > 2);
         }
+    }
+
+    [Fact]
+    public void SendDataRequest_RejectsAnEmptyPayloadAndABadUserId()
+    {
+        Assert.Throws<ArgumentException>(
+            () => Mcs.BuildSendDataRequest(1004, Rdp.McsGlobalChannel, []));
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => Mcs.BuildSendDataRequest(1000, Rdp.McsGlobalChannel, [0x01]));
     }
 }
 
