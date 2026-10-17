@@ -84,6 +84,13 @@ internal static class Program
             connectionOptions = connectionOptions with { Security = SecurityModeSelection.TlsOnly };
         }
 
+        if (options.ContainsKey("classic-user"))
+        {
+            // Off by default: the block puts the password on the wire in the
+            // clear, and MS-RDPBCGR does not define it.
+            connectionOptions = connectionOptions with { SendClassicUserBlock = true };
+        }
+
         await using var connection = new RdpConnection();
         connection.OnEvent += evt =>
         {
@@ -172,6 +179,10 @@ internal static class Program
               --no-correlation
                          omit the MS-RDPBCGR 2.2.1.1.1 correlation block,
                          sending the minimal 19-byte connection request
+              --classic-user
+                         send the classic-RDP user block, which carries the
+                         password in UTF-16 in the clear. MS-RDPBCGR does not
+                         define it and most servers ignore it.
               --help     show this help
 
             The password is read from the RDP_PASSWORD environment variable and is
