@@ -47,7 +47,7 @@ exists for IntelliSense; everything non-obvious is documented at the member.
 | TLS handshake | MS-RDPEA 3.1.5.1 | Verified, TLS 1.2 and 1.3 |
 | CredSSP `TSRequest` envelope | MS-CSSP 2.2.1 | **Encoded and verified structurally**; host now parses it |
 | SPNEGO + NTLM | MS-NLMP | **Not working**, host returns `SEC_E_INVALID_TOKEN` |
-| MCS Connect Initial / Response | 2.2.1.3.4, 2.2.1.3.5 | **Verified against xrdp** |
+| MCS Connect Initial / Response | 2.2.1.3, 2.2.1.4 | **Verified against xrdp** |
 | GCC client data (`TS_UD_CS_*`) | 2.2.1.3 | **Verified against xrdp**; the blocks are accepted |
 | Erect Domain / Attach User / Channel Join | 2.2.1.5, 2.2.1.6, 2.2.1.8 | **Verified against xrdp**, and the Confirms are read |
 | RSA key exchange, session keys, MCS encryption | 5.3.2 | Not started |
@@ -73,23 +73,51 @@ server states which user id it assigned, and the Channel Join Request must
 carry that id. A conventional 1001 is not a substitute.
 
 xrdp reports the same failure from the other side, so the two have to be read
-together:
-
-```text
-client: joined MCS channel 1003
-xrdp:   [ERROR] Processing [ITU-T T.25] ChannelJoinRequest failed
-        [ERROR] libxrdp_force_read: header read error
-```
+together - see [Reading the channel join](#reading-the-channel-join) for the
+current pair and what each one means.
 
 ## Reading the channel join
 
-`expecting_channel_join_requests` is set after the Attach User Confirm in xrdp,
-and its comment says "zero or more channel join requests are expected at this
-point". A client that joins only the MCS global channel and then stops gets one
-`ChannelJoinRequest` accepted and a second read that hits EOF. Seeing exactly
-that pair - one accepted join, then a read error on the *next* join - means the
-framing is right and the session simply ended early, which is what happens
-before the capability exchange exists.
+**A client sends one Channel Join Request per static virtual channel, plus one
+for the MCS user channel (1001) and one for the global channel (1003).** Joining
+only the global channel is not "stopping early"; it is the wrong number of joins,
+and it has nothing to do with which stage is implemented.
+
+This was measured, not inferred. xrdp's `handle_channel_join_requests` says it
+expects a join "for each of the static virtual channels, plus the user channel
+(self->chanid) and the I/O channel (MCS_GLOBAL_CHANNEL)" and computes
+
+```c
+expected_join_count = self->channel_list->count + 2;
+```
+
+`channel_list` is built from the client's own `TS_UD_CS_NET`, so the count
+follows what was offered. xrdp sets `self->chanid = 1001`. Static channel ids are
+positional from one above the global channel - xrdp uses
+`MCS_GLOBAL_CHANNEL + (index + 1)`, FreeRDP sets
+`mcs->baseChannelId = MCS_GLOBAL_CHANNEL_ID + 1`, and both mean 1004 + N.
+
+The log difference is unambiguous. With one join:
+
+```text
+[ERROR] Processing [ITU-T T.25] ChannelJoinRequest failed
+[ERROR] [MCS Connection Sequence (TLS)] receive channel join request failed
+[ERROR] xrdp_sec_incoming: xrdp_mcs_incoming failed
+[ERROR] xrdp_rdp_incoming: xrdp_sec_incoming failed
+```
+
+That whole chain is the client being one join short, and it disappears with the
+full set. What remains is `libxrdp_force_read: header read error` in
+`libxrdp_process_data`, which is the normal data loop meeting a disconnect - the
+honest boundary before the Demand Active PDU.
+
+`Expected N channel join PDUs but got N` is only a warning in xrdp, so its
+**absence** is the signal that the count matched. That is the check to make after
+changing the channel list.
+
+Read every Channel Join Confirm and compare the channel it names against the one
+requested. The result octet alone says "success"; the channel id is what proves
+which channel was joined.
 
 Windows refuses `PROTOCOL_SSL` alone with failure code 5,
 `SSL_REQUIRED_BY_SERVER`, because it wants NLA. So the Windows host cannot
@@ -200,13 +228,27 @@ reason `docs/protocol.md` exists; read it before touching an encoder.
     `(0xe - (uint)(uVar3 < 0x80)) + uVar3`, which is `12 + width + clientData`.
     Note the corollary: a total that crosses 0x80 while the client data does not
     still takes two octets, so the two widths are not interchangeable.
+17. **Join every channel, not just the global one.** One Channel Join Request per
+    static virtual channel offered, plus the MCS user channel **1001** and the
+    global channel **1003**. Static channel ids are positional at 1004 + N. See
+    [Reading the channel join](#reading-the-channel-join); a client that joins
+    only 1003 produces xrdp's whole `ChannelJoinRequest failed` chain.
+18. **The Channel Join Confirm's option bits do not mean what the Attach User
+    Confirm's do.** `0x02` marks the *initiator* in the Attach User Confirm and
+    the *channel id* in the Channel Join Confirm, where xrdp writes initiator and
+    requested unconditionally beside it. Read the channel id only when the bit is
+    set, and check it against the channel that was requested - the result octet
+    alone will report success for a channel that was never joined.
 
 ## Section numbers, and a block that does not exist
 
-Several references were wrong long enough to hide the defects above:
+- Several references were wrong long enough to hide the defects above:
 
-- The MCS connection PDUs are **2.2.1.5, 2.2.1.6 and 2.2.1.8**, not
-  2.2.1.3.6-8, which are the client data blocks.
+- The MCS connection PDUs are **2.2.1.5, 2.2.1.6, 2.2.1.7, 2.2.1.8 and
+  2.2.1.9**, not 2.2.1.3.6-8, which are the client data blocks. 2.2.1.3 is the
+  Connect Initial and 2.2.1.4 the Connect Response. `docs/` was corrected but the
+  source files kept the wrong numbers for longer; the authoritative list is the
+  spec's own `toc.json`, which is one request and settles every one of them.
 - `TS_UD_CS_CLUSTER` is **2.2.1.3.5**, not 2.2.1.3.4.4.
 - **`TS_UD_CS_USER` does not exist in MS-RDPBCGR.** xrdp answers
   `TS_UD_HEADER type 0xc00e is unknown (ignored)`. It is a classic-RDP
