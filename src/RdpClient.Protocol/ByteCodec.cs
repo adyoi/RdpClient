@@ -50,6 +50,27 @@ public sealed class ByteWriter
     }
 
     /// <summary>
+    /// Overwrite a 16-bit value already written at <paramref name="offset"/>.
+    /// </summary>
+    /// <remarks>
+    /// Needed where a length field precedes the bytes it counts, so the value is
+    /// not known when the field is written. Writing a placeholder and patching
+    /// it afterwards keeps the two from drifting apart.
+    /// </remarks>
+    public ByteWriter U16At(int offset, int value)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        if (offset + 2 > _length)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(offset), offset, "the offset is beyond what has been written");
+        }
+
+        BinaryPrimitives.WriteUInt16LittleEndian(_buffer.AsSpan(offset), (ushort)value);
+        return this;
+    }
+
+    /// <summary>
     /// Big-endian 16-bit write. RDP is little-endian throughout except the TPKT
     /// length, which RFC 1006 defines in network byte order.
     /// </summary>
@@ -126,12 +147,38 @@ public sealed class ByteWriter
     /// <summary>Write text into a fixed-width field, NUL-padded to <paramref name="byteLength"/>.</summary>
     public ByteWriter FixedUtf16(string value, int byteLength)
     {
+        ArgumentNullException.ThrowIfNull(value);
+
         int maxChars = byteLength / 2;
         string clipped = value.Length <= maxChars ? value : value[..maxChars];
         byte[] raw = System.Text.Encoding.Unicode.GetBytes(clipped);
         int take = Math.Min(raw.Length, byteLength);
         Bytes(raw.AsSpan(0, take));
         for (int i = take; i < byteLength; i++)
+        {
+            U8(0);
+        }
+
+        return this;
+    }
+
+    /// <summary>
+    /// Write ASCII into a fixed 8-octet field, NUL-padded, as CHANNEL_DEF::name.
+    /// </summary>
+    /// <remarks>
+    /// The field is fixed width with no length prefix, so it is exactly eight
+    /// octets whatever the name is. Characters outside the 7-bit range are
+    /// replaced rather than silently truncated to one octet each, which would
+    /// otherwise shift the rest of the structure.
+    /// </remarks>
+    public ByteWriter FixedAscii8(string value)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+
+        byte[] raw = System.Text.Encoding.ASCII.GetBytes(value);
+        int take = Math.Min(raw.Length, 8);
+        Bytes(raw.AsSpan(0, take));
+        for (int i = take; i < 8; i++)
         {
             U8(0);
         }
