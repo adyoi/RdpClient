@@ -88,9 +88,9 @@ public enum SecurityModeSelection
 /// Drives the RDP connection sequence up to the MCS channel join.
 /// </summary>
 /// <remarks>
-/// Covers MS-RDPBCGR 2.2.1.1 through 2.2.1.3.8: X.224 negotiation, the
+/// Covers MS-RDPBCGR 2.2.1.1 through 2.2.1.9: X.224 negotiation, the
 /// External Security Protocol, the MCS/GCC connection, then the domain erect,
-/// user attach and channel join that must precede any application traffic.
+/// user attach and channel joins that must precede any application traffic.
 /// Graphics and input are not yet part of this stage, and the log makes the
 /// stopping point explicit so a caller can tell a refused connection from an
 /// incomplete one.
@@ -260,8 +260,10 @@ public sealed class RdpConnection : IAsyncDisposable
                 Report(HandshakeStage.Renegotiated, "repeated RDP negotiation inside the CredSSP channel");
             }
 
-            // --- 2.2.1.3.4 MCS Connect Initial ---
+            // --- 2.2.1.3 MCS Connect Initial ---
             byte[] clientInfo = BuildClientInfo(options.User, options.Core, selected, options);
+            var channels = ClientPdu.DefaultChannels();
+            int channelCount = channels.Count;
             byte[] connectInitial = Mcs.BuildConnectInitialPdu(new Mcs.ConnectInitialOptions
             {
                 ClientInfo = clientInfo,
@@ -282,12 +284,18 @@ public sealed class RdpConnection : IAsyncDisposable
             ServerNodeId = connectResponse.ServerNodeId?.ToString();
             Report(HandshakeStage.McsAccepted, connectResponse.Summary);
 
-            // --- 2.2.1.3.6 Erect Domain, 2.2.1.3.7 Attach User, 2.2.1.3.8 join ---
+            // --- 2.2.1.5 Erect Domain, 2.2.1.6 Attach User, 2.2.1.8 channel join ---
             //
-            // Each of these is answered by the server, and each answer is what
-            // proves the step worked. Sending them and declaring success without
-            // reading the replies is how a connection that the server rejected
-            // at the first PDU gets reported as a completed channel join.
+            // Each step the server answers is answered with a reply, and the
+            // reply is what proves the step worked. Sending them and declaring
+            // success without reading the replies is how a connection that the
+            // server rejected at the first PDU gets reported as a completed
+            // channel join.
+            //
+            // The Erect Domain Request is the exception: T.125 has no confirm for
+            // it, which is why the Attach User Confirm is the first reply read
+            // here. xrdp says as much where it sets
+            // expecting_channel_join_requests, "after the attach user confirm".
             byte[] erect = Mcs.BuildErectDomainRequest();
             await _channel.WriteAsync(erect, cancellationToken);
             await _channel.FlushAsync(cancellationToken);
@@ -310,17 +318,13 @@ public sealed class RdpConnection : IAsyncDisposable
             UserId = assigned;
             Report(HandshakeStage.UserAttached, attachConfirm.Summary);
 
-            byte[] join = Mcs.BuildChannelJoinRequest(assigned, Rdp.McsGlobalChannel);
-            await _channel.WriteAsync(join, cancellationToken);
-            await _channel.FlushAsync(cancellationToken);
-
-            var joinConfirm = Mcs.ParseChannelJoinConfirm(await ReadTpktAsync(cancellationToken));
-            if (!joinConfirm.Success)
-            {
-                throw new RdpProtocolException($"the server refused the channel join: {joinConfirm.Summary}");
-            }
-
-            Report(HandshakeStage.ChannelJoined, joinConfirm.Summary);
+            // Every channel offered in TS_UD_CS_NET is joined by its own Channel
+            // Join Request, then the MCS user channel and the global channel.
+            // xrdp counts the joins it expects as channel_list->count + 2, so a
+            // client that joins only the global channel leaves the server reading
+            // a join that will never arrive - which is what its log reports as a
+            // channel join failure after a clean single join.
+            await JoinChannelsAsync(assigned, channelCount, cancellationToken).ConfigureAwait(false);
 
             Report(HandshakeStage.Complete,
                 "MCS channel joined. The capability exchange, graphics and input are "
@@ -387,6 +391,64 @@ public sealed class RdpConnection : IAsyncDisposable
         }
 
         return joined.ToArray();
+    }
+
+    /// <summary>
+    /// Join every channel the connection needs, one Channel Join Request each,
+    /// reading a Confirm for every one.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The order and the count are not this client's invention. xrdp's
+    /// <c>handle_channel_join_requests</c> says it expects a join "for each of the
+    /// static virtual channels, plus the user channel (self-&gt;chanid) and the I/O
+    /// channel (MCS_GLOBAL_CHANNEL)", and computes
+    /// <c>expected_join_count = channel_list-&gt;count + 2</c>. Its
+    /// <c>channel_list</c> is built from the client's own TS_UD_CS_NET, so the
+    /// count depends on what was offered, not on a fixed number.
+    /// </para>
+    /// <para>
+    /// Static channel ids are assigned by position, so the Nth channel offered
+    /// gets 1004 + N. FreeRDP and xrdp both derive the base from the global
+    /// channel id rather than hardcoding 1004.
+    /// </para>
+    /// <para>
+    /// Every Confirm is checked against the channel that was asked for. A Confirm
+    /// that reports success for a different channel is a failure, not a success
+    /// to be reported.
+    /// </para>
+    /// </remarks>
+    private async Task JoinChannelsAsync(
+        ushort userId, int staticChannelCount, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(_channel);
+
+        var targets = new List<ushort>(staticChannelCount + 2);
+        for (int i = 0; i < staticChannelCount; i++)
+        {
+            targets.Add(Rdp.McsStaticChannel(i));
+        }
+
+        targets.Add(Rdp.McsUserChannel);
+        targets.Add(Rdp.McsGlobalChannel);
+
+        foreach (ushort channel in targets)
+        {
+            byte[] join = Mcs.BuildChannelJoinRequest(userId, channel);
+            await _channel.WriteAsync(join, cancellationToken).ConfigureAwait(false);
+            await _channel.FlushAsync(cancellationToken).ConfigureAwait(false);
+
+            var confirm = Mcs.ParseChannelJoinConfirm(
+                await ReadTpktAsync(cancellationToken).ConfigureAwait(false),
+                expectedChannel: channel);
+
+            if (!confirm.Success)
+            {
+                throw new RdpProtocolException($"the server refused the channel join: {confirm.Summary}");
+            }
+
+            Report(HandshakeStage.ChannelJoined, confirm.Summary);
+        }
     }
 
     /// <summary>

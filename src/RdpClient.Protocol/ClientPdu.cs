@@ -6,8 +6,9 @@ namespace RdpClient.Protocol;
 /// <remarks>
 /// MS-RDPBCGR 2.2.1.3 defines TS_UD_CS_CORE, SECURITY, NET, CLUSTER and the
 /// extended blocks. Every one of them begins with the same 4-byte
-/// <c>TS_UD_HEADER</c> (type, flags, length), whose length is the size of the
-/// whole block including the header.
+/// <c>TS_UD_HEADER</c> (MS-RDPBCGR 2.2.1.3.1), which is <c>type(2)</c> and
+/// <c>length(2)</c> - there is <em>no</em> flags field - and whose length is the
+/// size of the whole block including the header.
 /// </remarks>
 public static class ClientPdu
 {
@@ -169,6 +170,9 @@ public static class ClientPdu
 
     public sealed record VirtualChannelOption(string Name, uint Options = Rdp.VChannel.OptionInitialized);
 
+    /// <summary>Upper bound on <c>channelCount</c>, from MS-RDPBCGR 2.2.1.3.4.</summary>
+    public const int MaxChannelCount = 31;
+
     /// <summary>
     /// Build TS_UD_CS_NET (MS-RDPBCGR 2.2.1.3.4).
     /// </summary>
@@ -189,6 +193,18 @@ public static class ClientPdu
     public static byte[] BuildNet(IReadOnlyList<VirtualChannelOption> channels)
     {
         ArgumentNullException.ThrowIfNull(channels);
+
+        // channelCount is a 32-bit field but the structure caps it at 31
+        // (MS-RDPBCGR 2.2.1.3.4). A larger list is rejected here rather than
+        // written, because the server is entitled to read only 31 definitions
+        // and the rest of the block would be parsed as something else.
+        if (channels.Count > MaxChannelCount)
+        {
+            throw new ArgumentException(
+                $"MS-RDPBCGR 2.2.1.3.4 allows at most {MaxChannelCount} static "
+                + $"virtual channels, {channels.Count} were given",
+                nameof(channels));
+        }
 
         var w = new ByteWriter(16 + channels.Count * 12);
         w.U16(Rdp.TsUdCsNet);
@@ -214,11 +230,11 @@ public static class ClientPdu
         return w.ToArray();
     }
 
-    // TS_UD_CS_CLUSTER flags (MS-RDPBCGR 2.2.1.3.4.4.1).
+    // TS_UD_CS_CLUSTER fields (MS-RDPBCGR 2.2.1.3.5).
     public const uint RedirectionSupported = 0x00000001;
     public const uint RedirectionVersion4 = 0x00000002;
 
-    // RedirFlags sub-fields (MS-RDPBCGR 2.2.1.3.4.4.2).
+    // RedirFlags sub-fields (MS-RDPBCGR 2.2.1.3.5).
     [Flags]
     public enum RedirectionFlags : uint
     {
@@ -267,7 +283,10 @@ public static class ClientPdu
         writer.U16At(2, writer.Length);
     }
 
-    // TS_UD_CS_USER flags (MS-RDPBCGR 2.2.1.3.4.5.1.1).
+    // MS-RDPBCGR defines no TS_UD_CS_USER block at all. These flags describe the
+    // structure this class can still emit for callers that ask for it; they are
+    // transcribed from the classic-RDP definition, which is not the Open
+    // Specification. See BuildUser.
     [Flags]
     public enum UserFlags : uint
     {
@@ -360,8 +379,22 @@ public static class ClientPdu
     }
 
     /// <summary>
-    /// The static channel set a Windows RDS host expects to be offered.
+    /// The static channel set offered in TS_UD_CS_NET.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This list is not measured from a real client. Searching
+    /// <c>mstscax.dll</c> for these names finds <c>rdpdr</c>, <c>cliprdr</c> and
+    /// <c>drdynvc</c>, each as a UTF-16 string in <c>.rdata</c>; <c>rdpgfx</c>,
+    /// <c>urbout</c>, <c>encomsp</c> and <c>audin</c> are absent from that
+    /// binary in both ASCII and UTF-16, so the other clients are evidently
+    /// registered from somewhere this search does not reach.
+    /// </para>
+    /// <para>
+    /// The order matters beyond the names, because static virtual channel ids
+    /// are assigned by position: the Nth channel offered gets MCS id 1004 + N.
+    /// </para>
+    /// </remarks>
     public static IReadOnlyList<VirtualChannelOption> DefaultChannels() =>
     [
         new("rdpdr"),

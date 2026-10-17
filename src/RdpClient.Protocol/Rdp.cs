@@ -71,7 +71,14 @@ public static class Rdp
     public const uint KeyExchangeAlgRsaFull = 0x00000001;
     public const uint KeyExchangeAlgDh = 0x00000002;
 
-    // --- MCS (MS-RDPBCGR 2.2.1.3.1, 2.2.1.3.4, 2.2.1.3.6) ------------------
+    // --- MCS (MS-RDPBCGR 2.2.1.3 - 2.2.1.9) -------------------------------
+    //
+    // 2.2.1.3 is the Connect Initial with its GCC Conference Create Request,
+    // 2.2.1.4 the Connect Response, and 2.2.1.5 through 2.2.1.9 the domain PDUs
+    // that follow: Erect Domain Request, Attach User Request and Confirm,
+    // Channel Join Request and Confirm. The 2.2.1.3.x numbers are the client data
+    // blocks inside the Connect Initial, not the MCS PDUs, which is an easy and
+    // consequential confusion.
 
     public const byte McsUdConnectInitial = 0x7f;
     public const byte McsUdConnectResponse = 0x7e;
@@ -104,7 +111,7 @@ public static class Rdp
         (byte)((choice << 2) | (options & 0x03));
 
     /// <summary>
-    /// The MCS global channel, 1003 (T.125 section 7.6, MS-RDPBCGR 2.2.1.3.8).
+    /// The MCS global channel, 1003 (T.125 section 7.6, MS-RDPBCGR 2.2.1.8).
     /// </summary>
     /// <remarks>
     /// 1007 is the H.225.0 RTP channel number and appears in some non-RDP
@@ -112,6 +119,39 @@ public static class Rdp
     /// that joins 1007 is joining a channel no server created.
     /// </remarks>
     public const ushort McsGlobalChannel = 1003;
+
+    /// <summary>The MCS user channel, 1001 (MS-RDPBCGR 2.2.1.8).</summary>
+    /// <remarks>
+    /// This is a channel the client is required to join, and not an optional
+    /// extra. xrdp sets <c>self-&gt;chanid = 1001</c> at MCS construction and counts
+    /// the joins it expects as
+    /// <c>channel_list-&gt;count + 2</c>: one per static virtual channel the client
+    /// offered, plus this user channel, plus the global channel. A client that
+    /// joins only 1003 is one join short of a count that has nothing to do with
+    /// which stage it has implemented.
+    /// </remarks>
+    public const ushort McsUserChannel = 1001;
+
+    /// <summary>
+    /// The first static virtual channel id, one above the global channel
+    /// (MS-RDPBCGR 2.2.1.8).
+    /// </summary>
+    /// <remarks>
+    /// Static virtual channels are numbered in the order they were offered in
+    /// TS_UD_CS_NET, starting immediately above the global channel. FreeRDP sets
+    /// <c>mcs-&gt;baseChannelId = MCS_GLOBAL_CHANNEL_ID + 1</c> and allocates from
+    /// there; xrdp assigns <c>MCS_GLOBAL_CHANNEL + (index + 1)</c>. Both make the
+    /// Nth offered channel id 1004 + N.
+    /// </remarks>
+    public const ushort McsStaticChannelBase = 1004;
+
+    /// <summary>The MCS channel id of the Nth static virtual channel, from zero.</summary>
+    /// <param name="index">Position in the TS_UD_CS_NET channel list.</param>
+    public static ushort McsStaticChannel(int index)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(index);
+        return (ushort)(McsStaticChannelBase + index);
+    }
 
     /// <summary>Lowest dynamic channel id, the base every MCS UserId is offset from.</summary>
     public const ushort McsUserChannelBase = 1001;
@@ -126,11 +166,12 @@ public static class Rdp
     /// </remarks>
     public const string McsConferenceName = "1";
 
-    // --- Client-to-server PDU headers (MS-RDPBCGR 2.2.1.3.4.1) ------------
+    // --- Client-to-server PDU headers (MS-RDPBCGR 2.2.1.3.1) ------------
     //
-    // These TSFC discriminators are 16-bit little-endian values. Writing them
+    // The discriminators are 16-bit little-endian values. Writing them
     // as a single byte truncates 0xC001 to 0x01 and every following field lands
-    // at the wrong offset.
+    // at the wrong offset. TS_UD_HEADER itself is type(2), length(2), with no
+    // flags field.
 
     public const ushort TsUdCsCore = 0xc001;
     public const ushort TsUdCsSecurity = 0xc002;
@@ -164,7 +205,7 @@ public static class Rdp
     public const ushort CapSetWindow = 0x0017;
     public const ushort CapSetMultitransport = 0x001a;
 
-    // --- Virtual channel identifiers (MS-RDPBCGR 2.2.1.3.4.1.3.1) ----------
+    // --- Virtual channel identifiers (MS-RDPBCGR 2.2.1.3.4.1) ------------
 
     public static class VChannel
     {

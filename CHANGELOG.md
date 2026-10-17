@@ -28,6 +28,47 @@ actually confirmed.
 
 ### Fixed
 
+- **The client joined one channel where the server expected ten.** A client sends
+  one Channel Join Request per static virtual channel it offered, plus one for the
+  MCS user channel and one for the global channel. This client sent only the
+  global channel, so xrdp was left reading a join that would never arrive. Its
+  whole error chain was the symptom:
+
+  ```text
+  [ERROR] Processing [ITU-T T.25] ChannelJoinRequest failed
+  [ERROR] [MCS Connection Sequence (TLS)] receive channel join request failed
+  [ERROR] xrdp_sec_incoming: xrdp_mcs_incoming failed
+  [ERROR] xrdp_rdp_incoming: xrdp_sec_incoming failed
+  ```
+
+  All four are gone. Measured from xrdp's `handle_channel_join_requests`, which
+  expects `channel_list->count + 2` joins and sets `self->chanid = 1001`; static
+  channel ids are positional at 1004 + N, which FreeRDP and xrdp both derive from
+  the global channel id. xrdp's `Expected N channel join PDUs but got N` is only
+  a warning, so its absence is what shows the count matched. The documentation
+  claimed this state was expected; it was not, and it said so.
+- **A Channel Join Confirm for the wrong channel was reported as a success.** The
+  result octet alone was taken as proof and whatever channel id followed was
+  echoed back. The Confirm now has to name the channel that was requested, which
+  is the same "reported success it never verified" defect this connection
+  sequence was rewritten to remove.
+- **The Channel Join Confirm's optional channel id was read unconditionally.**
+  Opcode bit `0x02` marks it present, and the bit means something different in
+  each Confirm: xrdp sets it for the *initiator* in the Attach User Confirm and
+  for the *channel id* in the Channel Join Confirm, having written initiator and
+  requested unconditionally beside it.
+- **The MCS PDUs carried the wrong MS-RDPBCGR section numbers.** 2.2.1.3.x are
+  the client data blocks; the domain PDUs are 2.2.1.5 (Erect Domain Request),
+  2.2.1.6 and 2.2.1.7 (Attach User Request and Confirm) and 2.2.1.8 and 2.2.1.9
+  (Channel Join Request and Confirm), with 2.2.1.3 the Connect Initial and
+  2.2.1.4 the Connect Response. The prose had been corrected and the source files
+  had not. Verified against the specification's own `toc.json`.
+- **`ClientPdu`'s class documentation still described `TS_UD_HEADER` as
+  type/flags/length.** There is no flags field, and that wrong description is
+  what the header's six-octet defect came from in the first place.
+- **`TS_UD_CS_NET` accepted more than 31 static channels.** MS-RDPBCGR 2.2.1.3.4
+  caps `channelCount` at 31, and a server is entitled to read only 31
+  definitions.
 - **The client reported success it had not verified.** This was the most
   serious defect in the project. The Erect Domain, Attach User and Channel Join
   requests were written and `ConnectAsync` returned `Complete` without reading
@@ -153,7 +194,13 @@ actually confirmed.
 ### Changed
 
 - The MCS global channel is joined as **1003**, and the join is only reported
-  complete once the server's Channel Join Confirm has been read.
+  complete once the server's Channel Join Confirm has been read. Every channel is
+  now joined and every Confirm checked, not just this one.
+- The static channel list is now documented as **unverified**. Searching
+  `mstscax.dll` finds `rdpdr`, `cliprdr` and `drdynvc` as UTF-16 strings, but
+  `rdpgfx`, `urbout`, `encomsp` and `audin` appear nowhere in that binary in
+  either encoding, so the other clients are registered from somewhere a string
+  search does not reach. The list is a guess and now says so.
 - Authentication traces what it sends and receives, so a failure names the stage
   and the token type instead of surfacing as a flattened TLS error.
 - The exchange now advances. The host accepts the NEGOTIATE and returns an NTLM

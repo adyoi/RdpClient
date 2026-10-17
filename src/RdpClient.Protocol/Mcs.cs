@@ -1,18 +1,25 @@
 namespace RdpClient.Protocol;
 
 /// <summary>
-/// MCS connection and channel primitives (MS-RDPBCGR 2.2.1.3.1 - 2.2.1.3.6).
+/// MCS connection and channel primitives (MS-RDPBCGR 2.2.1.3 - 2.2.1.9).
 /// </summary>
 /// <remarks>
 /// MCS is the T.125 presentation layer that carries GCC and the rest of the
 /// connection. After Connect Initial/Response the client must erect the server
-/// domain, attach itself as a user, and join the MCS global channel before any
+/// domain, attach itself as a user, and join its channels before any
 /// application data can flow.
+/// <para>
+/// The section numbers matter and were wrong here for a long time. 2.2.1.3 is
+/// the Connect Initial and its 2.2.1.3.x subsections are the client data blocks
+/// inside it; the MCS domain PDUs are 2.2.1.5 (Erect Domain Request), 2.2.1.6
+/// and 2.2.1.7 (Attach User Request and Confirm) and 2.2.1.8 and 2.2.1.9
+/// (Channel Join Request and Confirm).
+/// </para>
 /// </remarks>
 public static class Mcs
 {
     /// <summary>
-    /// Build the GCC Conference Create Request (MS-RDPBCGR 2.2.1.3.2).
+    /// Build the GCC Conference Create Request (MS-RDPBCGR 2.2.1.3).
     /// </summary>
     /// <remarks>
     /// The byte layout was confirmed against <c>mstscax.dll</c>, the COM control
@@ -100,7 +107,7 @@ public static class Mcs
     }
 
     /// <summary>
-    /// Build the T.125 Connect-Initial (MS-RDPBCGR 2.2.1.3.4.1).
+    /// Build the T.125 Connect-Initial (MS-RDPBCGR 2.2.1.3).
     /// </summary>
     /// <remarks>
     /// <para>
@@ -161,7 +168,7 @@ public static class Mcs
     }
 
     /// <summary>
-    /// Wrap a Connect Initial in the X.224 Data TPDU envelope (2.2.1.3.1).
+    /// Wrap a Connect Initial in the X.224 Data TPDU envelope (MS-RDPBCGR 2.2.1.3).
     /// </summary>
     /// <remarks>
     /// Only the negotiation request is a Connection Request TPDU. Everything
@@ -202,7 +209,7 @@ public static class Mcs
         byte[] Raw);
 
     /// <summary>
-    /// Parse an MCS Connect Response (MS-RDPBCGR 2.2.1.3.5).
+    /// Parse an MCS Connect Response (MS-RDPBCGR 2.2.1.4).
     /// </summary>
     public static ConnectResponse ParseConnectResponse(byte[] buffer)
     {
@@ -332,7 +339,7 @@ public static class Mcs
 
     /// <summary>
     /// Read the GCC Conference Create Response inside the Connect-Response's
-    /// user data (MS-RDPBCGR 2.2.1.3.3).
+    /// user data (MS-RDPBCGR 2.2.1.4).
     /// </summary>
     /// <remarks>
     /// <para>
@@ -401,7 +408,7 @@ public static class Mcs
         return true;
     }
 
-    /// <summary>Build an MCS Erect Domain Request (MS-RDPBCGR 2.2.1.3.5).</summary>
+    /// <summary>Build an MCS Erect Domain Request (MS-RDPBCGR 2.2.1.5).</summary>
     /// <remarks>
     /// <para>
     /// Wrapped in TPKT and an X.224 Data TPDU. Every MCS domain PDU the client
@@ -422,7 +429,7 @@ public static class Mcs
             [0x01, 0x00,   // subHeight = 0, as a PER length plus its value
              0x01, 0x00]); // subInterval = 0
 
-    /// <summary>Build an MCS Attach User Request (MS-RDPBCGR 2.2.1.3.7.1.1).</summary>
+    /// <summary>Build an MCS Attach User Request (MS-RDPBCGR 2.2.1.6).</summary>
     /// <remarks>
     /// The PDU has no fields of its own: T.125 puts the assigned user id in the
     /// server's Attach User Confirm, not in the request. The only octets are
@@ -431,7 +438,12 @@ public static class Mcs
     public static byte[] BuildAttachUserRequest() =>
         BuildDomainPdu(Rdp.McsOpcode(Rdp.McsChoiceAttachUserRequest), []);
 
-    /// <summary>Build an MCS Channel Join Request (MS-RDPBCGR 2.2.1.3.8.1.1).</summary>
+    /// <summary>Build an MCS Channel Join Request (MS-RDPBCGR 2.2.1.8).</summary>
+    /// <remarks>
+    /// A client sends one of these per static virtual channel it offered, plus one
+    /// for the MCS user channel and one for the global channel. xrdp counts
+    /// exactly that: <c>channel_list-&gt;count + 2</c>.
+    /// </remarks>
     /// <param name="userId">
     /// The user id the server assigned in its Attach User Confirm. It is a PER
     /// INTEGER relative to the MCS base channel id of 1001, so 1001 itself is
@@ -439,7 +451,7 @@ public static class Mcs
     /// server rejects a join request whose initiator is not the user it
     /// attached.
     /// </param>
-    /// <param name="channelId">The channel to join, conventionally 1003.</param>
+    /// <param name="channelId">The channel to join.</param>
     public static byte[] BuildChannelJoinRequest(ushort userId, ushort channelId)
     {
         if (userId < Rdp.McsUserChannelBase)
@@ -512,7 +524,7 @@ public static class Mcs
     }
 
     /// <summary>
-    /// Parse an Attach User Confirm (MS-RDPBCGR 2.2.1.3.7).
+    /// Parse an Attach User Confirm (MS-RDPBCGR 2.2.1.7).
     /// </summary>
     /// <remarks>
     /// Returns the assigned user id, which is the value the Channel Join Request
@@ -557,12 +569,34 @@ public static class Mcs
     }
 
     /// <summary>
-    /// Parse a Channel Join Confirm (MS-RDPBCGR 2.2.1.3.9.1).
+    /// Parse a Channel Join Confirm (MS-RDPBCGR 2.2.1.9).
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The result alone is not enough to call this a success. The Confirm also
+    /// names the channel the server actually joined, and if that is not the
+    /// channel the client asked for then the join this code is about to report
+    /// did not happen - which is the same "reported success it never verified"
+    /// failure the rest of this connection sequence was rewritten to avoid.
+    /// </para>
+    /// <para>
+    /// What the two opcode option bits mean is per-PDU, and they are not
+    /// interchangeable between the Confirms. In the Attach User Confirm 0x02
+    /// says the initiator is present; in the Channel Join Confirm xrdp writes
+    /// the same bit for <c>channelId</c> and says so in its own comment, having
+    /// written initiator and requested unconditionally alongside it. So
+    /// initiator and requested are stepped over here unconditionally, and
+    /// channelId is only read when 0x02 is set.
+    /// </para>
+    /// </remarks>
     /// <param name="buffer">One TPKT-framed DomainMCSPDU.</param>
+    /// <param name="expectedChannel">
+    /// The channel the client asked to join, or null to accept whatever the
+    /// server names.
+    /// </param>
     /// <param name="expectedResult">The MCS result that means success, normally 0.</param>
     public static (bool Success, ushort? ChannelId, string Summary) ParseChannelJoinConfirm(
-        byte[] buffer, int expectedResult = 0)
+        byte[] buffer, ushort? expectedChannel = null, int expectedResult = 0)
     {
         var pdu = ParseDomainPdu(buffer);
         if (pdu.Choice != Rdp.McsChoiceChannelJoinConfirm)
@@ -580,13 +614,29 @@ public static class Mcs
         }
 
         r.Skip(2);                                   // initiator
-        r.U16BigEndian();                            // requested channel id
+        r.Skip(2);                                   // requested
+
+        // 0x02 marks the optional channelId field as present. Reading past the
+        // payload when it is absent produced a channel id out of thin air.
+        if ((pdu.Opcode & 0x02) == 0)
+        {
+            return (false, null,
+                "the Channel Join Confirm carries no channel id, so there is "
+                + "nothing to show that the requested channel was joined");
+        }
+
         if (r.Remaining < 2)
         {
-            return (true, null, "the Channel Join Confirm carried no channel id");
+            return (false, null, "the Channel Join Confirm ended before its channel id");
         }
 
         ushort channel = r.U16BigEndian();
+        if (expectedChannel is { } wanted && channel != wanted)
+        {
+            return (false, channel,
+                $"the server joined MCS channel {channel} but {wanted} was requested");
+        }
+
         return (true, channel, $"joined MCS channel {channel}");
     }
 

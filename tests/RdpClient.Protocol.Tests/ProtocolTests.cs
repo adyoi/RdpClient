@@ -671,6 +671,111 @@ public class McsTests
         Assert.False(Mcs.ParseChannelJoinConfirm(Mcs.BuildErectDomainRequest()).Success);
     }
 
+    /// <summary>
+    /// A Confirm that names a different channel is a failed join, not a success.
+    /// </summary>
+    /// <remarks>
+    /// The result octet alone said "success", and the old code reported whatever
+    /// channel it found afterwards. That is the same shape of defect as the one
+    /// this connection sequence was rewritten for: reporting a success the
+    /// server did not grant.
+    /// </remarks>
+    [Fact]
+    public void ChannelJoinConfirm_RejectsAChannelTheServerDidNotJoin()
+    {
+        // 03 00 00 0f | 02 f0 80 | 3e | 00 | 0001 | 03eb | 03eb
+        byte[] confirm = Convert.FromHexString("0300000f02f8803e00000103eb03eb");
+
+        Assert.True(Mcs.ParseChannelJoinConfirm(confirm, expectedChannel: 1003).Success);
+
+        var wrong = Mcs.ParseChannelJoinConfirm(confirm, expectedChannel: 1001);
+        Assert.False(wrong.Success);
+        Assert.Equal((ushort)1003, wrong.ChannelId);
+        Assert.Contains("1001 was requested", wrong.Summary, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The optional channel id is marked by opcode bit 0x02, not assumed.
+    /// </summary>
+    /// <remarks>
+    /// The bit means something different in each Confirm: xrdp sets it for the
+    /// initiator in the Attach User Confirm and for the channel id in the Channel
+    /// Join Confirm. Reading the channel id without checking the bit produced a
+    /// value out of whatever followed.
+    /// </remarks>
+    [Fact]
+    public void ChannelJoinConfirm_FailsWhenTheChannelIdIsAbsent()
+    {
+        // Same PDU with the channel id bit cleared: 3c rather than 3e.
+        byte[] confirm = Convert.FromHexString("0300000d02f8803c00000103eb");
+
+        var result = Mcs.ParseChannelJoinConfirm(confirm, expectedChannel: 1003);
+
+        Assert.False(result.Success);
+        Assert.Null(result.ChannelId);
+        Assert.Contains("no channel id", result.Summary, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Static channel ids are positional, from one above the global channel.
+    /// </summary>
+    /// <remarks>
+    /// xrdp expects <c>channel_list-&gt;count + 2</c> joins and assigns the Nth
+    /// static channel <c>MCS_GLOBAL_CHANNEL + (index + 1)</c>; FreeRDP sets
+    /// <c>baseChannelId = MCS_GLOBAL_CHANNEL_ID + 1</c>. Both derive from the
+    /// global channel rather than hardcoding 1004, and both are 1004 + N.
+    /// </remarks>
+    [Theory]
+    [InlineData(0, 1004)]
+    [InlineData(1, 1005)]
+    [InlineData(7, 1011)]
+    public void McsStaticChannel_IsOneAboveTheGlobalChannel(int index, int expected)
+    {
+        Assert.Equal(expected, Rdp.McsStaticChannel(index));
+        Assert.Equal(1003, Rdp.McsGlobalChannel);
+        Assert.Equal(1001, Rdp.McsUserChannel);
+        Assert.Throws<ArgumentOutOfRangeException>(() => Rdp.McsStaticChannel(-1));
+    }
+
+    /// <summary>
+    /// The join sequence a server counts: one per static channel, then the user
+    /// channel, then the global channel.
+    /// </summary>
+    [Fact]
+    public void ChannelJoinSequence_CoversStaticThenUserThenGlobal()
+    {
+        int staticChannels = ClientPdu.DefaultChannels().Count;
+
+        var targets = new List<ushort>();
+        for (int i = 0; i < staticChannels; i++)
+        {
+            targets.Add(Rdp.McsStaticChannel(i));
+        }
+
+        targets.Add(Rdp.McsUserChannel);
+        targets.Add(Rdp.McsGlobalChannel);
+
+        // xrdp: expected_join_count = channel_list->count + 2
+        Assert.Equal(staticChannels + 2, targets.Count);
+        Assert.Equal((ushort)1004, targets[0]);
+        Assert.Equal((ushort)1001, targets[^2]);
+        Assert.Equal((ushort)1003, targets[^1]);
+    }
+
+    [Fact]
+    public void BuildNet_RejectsMoreThan31StaticChannels()
+    {
+        var tooMany = Enumerable.Range(0, 32)
+            .Select(i => new ClientPdu.VirtualChannelOption($"ch{i:00}"))
+            .ToArray();
+
+        Assert.Throws<ArgumentException>(() => ClientPdu.BuildNet(tooMany));
+
+        // 31 is the documented maximum, so it must be accepted: the 4-byte
+        // header, the 4-byte channelCount, then 12 octets per CHANNEL_DEF.
+        Assert.Equal(8 + 31 * 12, ClientPdu.BuildNet(tooMany.Take(31).ToArray()).Length);
+    }
+
     [Fact]
     public void SendDataRequest_ChunksLargePayloadsInsideTheMcsEnvelope()
     {
