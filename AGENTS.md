@@ -193,6 +193,13 @@ reason `docs/protocol.md` exists; read it before touching an encoder.
    `Not enough bytes in the stream: expected 35, remaining 23`; Windows ignores
    the discrepancy, so only a second implementation catches this class of
    defect.
+16. **The GCC `connectPDU` length counts its own inputs, not a constant.** It is
+    the client data, twelve octets of fixed framing, and the client-data length
+    field - and that field is one octet while the client data is below 0x80. A
+    flat 14 is right only above that. `mstscax.dll` writes
+    `(0xe - (uint)(uVar3 < 0x80)) + uVar3`, which is `12 + width + clientData`.
+    Note the corollary: a total that crosses 0x80 while the client data does not
+    still takes two octets, so the two widths are not interchangeable.
 
 ## Section numbers, and a block that does not exist
 
@@ -251,10 +258,26 @@ REA provides a Ghidra-backed MCP server. Setup on this machine:
 | --- | --- |
 | `GHIDRA_INSTALL_DIR` | `C:\tools\ghidra_12.1.4_PUBLIC` |
 | `JAVA_HOME` | `C:\tools\jdk-21.0.12.1+1` |
+| `GHIDRA_HEADLESS_MAXMEM` | `8G` |
 | Large binaries | `REA_GHIDRA_STARTUP_TIMEOUT_MS=1800000` |
 
 Those are written into `.config/opencode/opencode.json`; keep them there when
 regenerating client configuration.
+
+**`GHIDRA_HEADLESS_MAXMEM` is not optional.** `support/analyzeHeadless.bat`
+hardcodes `MAXMEM_DEFAULT=2G`, and Ghidra exits with code 1 partway through
+auto-analysis of `mstscax.dll` on that heap - the MCP call surfaces it as
+`execution_failure` with an `exit_code: 1` diagnostic, not as an out-of-memory
+error, so it reads like a broken analysis rather than a missing setting. The box
+had 8.9 GB free when it happened. Raising the default to 8G makes the same
+analysis complete in about ten minutes.
+
+**A string search will not find the H.221 key.** `Duca` is absent from every
+Ghidra-defined string Data item, so `search_strings` returns nothing and that
+looks like evidence of absence. It is an immediate embedded in the instruction
+stream, at `0x180163808` inside `FUN_180163600`, which is the GCC Conference
+Create Request builder. Search for the bytes in hex - `44 75 63 61` - rather
+than as text. `search_bytes` takes hex only and rejects a literal.
 
 ```powershell
 rea doctor --provider ghidra --json
