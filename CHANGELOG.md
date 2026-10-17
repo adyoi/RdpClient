@@ -9,8 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 The CredSSP envelope, which was missing entirely, plus the MCS client data and
 channel-setup encodings, which xrdp rejected outright. The connection now
-completes the MCS channel join against xrdp, and reports only what the server
-actually confirmed.
+completes the channel joins **and the mandatory capability exchange** against
+xrdp. The step the whole sequence was missing turned out to be the Client Info
+PDU - the Secure Settings Exchange that MS-RDPBCGR 1.3.1.1 places between the
+joins and the Capabilities Exchange.
 
 ### Added
 
@@ -25,13 +27,29 @@ actually confirmed.
 - **Parsing for the server's replies.** `AttachUserConfirm` and
   `ChannelJoinConfirm` are read and interpreted, and the client stops with the
   server's reason when either refuses.
+- **The Client Info PDU is sent after the channel joins.** That is the missing
+  handshake step: MS-RDPBCGR 1.3.1.1 places the Secure Settings Exchange there,
+  and xrdp's slow-path dispatch reaches "send demand active" only from its
+  `SEC_INFO_PKT` branch. `ClientInfo.cs` builds the PDU (TS_INFO_PACKET,
+  2.2.1.11) with the INFO flags xrdp requires on TLS connections and violates
+  nothing: no share-control wrap, sent on the global channel, always empty
+  password field unless the caller supplies one -
+  `InfoAutoLogon` follows the password. The password travels UTF-16 inside this
+  one PDU, protected by TLS; it is never hex-logged. xrdp answers with its
+  Licensing PDU, which the client skips by structure (`SEC_LICENSE_PKT` flag
+  with `flagsHi == 0`, then the `wMessageSize` preamble).
 - **The mandatory capability exchange is implemented** (MS-RDPBCGR 2.2.1.13).
   `Capability.cs` builds and parses the Share Control Header, the General
   Capability Set, the server's Demand Active PDU and the client's Confirm Active
   PDU, and `Mcs.ParseSendDataIndication` reads the MCS fragments a server PDU
   arrives in. `HandshakeStage` gains `CapabilityExchanged` and `ActiveConfirmed`.
-  Unit-tested, but **not verified against a live server** - see the note at the
-  end of this release.
+  **Verified against xrdp on 2026-10-17**: after the Client Info PDU the server
+  answered with a 20-octet Licensing PDU and a Demand Active naming 14
+  capability sets (Share, General, Bitmap, Font, Order, bitmap codecs, colour
+  cache, Pointer, Input, bitmap-cache v3, Multitransport, large pointer, frame
+  acknowledge, surface commands), and the Confirm Active the client sent back
+  drew no `TS_CONFIRM_ACTIVE_PDU` error from xrdp - the noise at the end of its
+  log is the probe's own disconnect.
 - **The handshake is bounded.** `RdpConnectionOptions.Timeout`, 30 seconds by
   default, `rdpprobe --timeout <seconds>`. Every read in the sequence is a
   blocking socket read, so a server that stopped mid-sequence left the client
@@ -45,6 +63,23 @@ actually confirmed.
 
 ### Fixed
 
+- **The T.125 SendDataRequest/SendDataIndication length was a little-endian u16
+  "including itself".** The real field is an [ITU-T X.691] length determinant,
+  in both directions: one octet at or below 127, otherwise two big-endian
+  octets with the `0x8x` marker and a value counting only the octets that
+  follow. The wrong encoding desynchronised xrdp by one byte; the stray length
+  byte joined the security header xrdp read next, the shifted flags carried
+  `SEC_EXCHANGE_PKT`, and the server answered
+  `xrdp_sec_recv : error - unexpected length 264448` - `0x00040900`, the
+  little-endian value of four bytes starting one octet into the payload.
+- **The Share Control Header packed the PDU type into the top of pduType.**
+  MS-RDPBCGR 2.2.8.1.1.1.1 keeps the type in the four least significant bits
+  with PDUVersion (TS_PROTOCOL_VERSION = 0x1) in the twelve above them, so a
+  Demand Active is `11 00` on the wire. xrdp masks `pdu_code & 0xf` when it
+  reads and FreeRDP writes `type | 0x10`; the old reading turned every real
+  Demand Active into "type 0" and the old builder spoke a format no peer
+  reads. A `totalLength` of `0x8000` now names itself: it introduces a T.128
+  FlowPDU, not a slow-path PDU.
 - **The client joined one channel where the server expected ten.** A client sends
   one Channel Join Request per static virtual channel it offered, plus one for the
   MCS user channel and one for the global channel. This client sent only the
@@ -197,19 +232,24 @@ actually confirmed.
 
 ### Known gaps
 
-- **The Demand Active PDU never arrives from this xrdp, so the capability
-  exchange is unverified end to end.** The MCS sequence completes - xrdp accepts
-  all ten channel joins, answers every Confirm, and logs
-  `xrdp_load_keyboard_layout`, which it only does once MCS completes - and then
-  xrdp sends nothing and waits. From its source that is not specific to one
-  strategy: `handle_channel_join_requests` does a `libxrdp_force_read` after
-  every join, and `libxrdp_process_data` does another before it will send the
-  Demand Active, so a client sending ten joins blocks xrdp on the first and a
-  client sending none blocks it on the second. Both were tried; both are silent.
-  What a client is supposed to send at that point, if anything, is still unknown.
-  A `tools/rdp-tap.mjs` capture of `mstsc` was the obvious next measurement and
-  did not settle it, because the MCS PDUs arrive inside TLS 1.3 and cannot be
-  read without the session keys.
+- **RESOLVED 2026-10-17: the missing step after the joins was the Client Info
+  PDU.** Earlier rounds tried a larger join count and then
+  `RNS_UD_CS_SUPPORT_SKIP_CHANNELJOIN`; under both, xrdp stayed silent, because
+  what xrdp waits for is not a join at all. Its slow-path dispatch wants the
+  Client Info PDU (the Secure Settings Exchange, MS-RDPBCGR 1.3.1.1), and
+  `xrdp_sec_recv` reaches "send demand active" only from the `SEC_INFO_PKT`
+  branch that consumes it. With the PDU sent on the MCS global channel the
+  capability exchange completes end to end; see the added and fixed entries.
+  The `mstsc` tap capture stayed unreadable under TLS 1.3, so this answer came
+  from xrdp's own sources plus a live probe against them.
+- **Everything after the Confirm Active is unimplemented.** The Synchronize,
+  Control and Font List send sequence, the Font Map reply, and all graphics and
+  input PDUs are still missing, so the probe stops after the capability
+  exchange: the session would show no desktop even on a server that got this
+  far. xrdp also sends sets the client does not interpret (bitmap codecs,
+  surface commands, frame acknowledge among the 14); the client's Confirm
+  Active advertises only the General set, which xrdp accepts, but real
+  downgrading behaviour is unverified.
 - **`TS_UD_CS_CORE` is 234 octets on the strength of the specification and
   FreeRDP, not a capture.** `mstscax.dll` builds the client data blocks through a
   COM vtable one hop beyond its only caller. It is pinned by a test now, which

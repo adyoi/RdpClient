@@ -103,9 +103,33 @@ so, because that is a different kind of answer from a constant.
 
 ## Q6 - What follows the Channel Join?
 
-This determines whether the honest stopping point is right. Report the next
-PDU type and its structure size, enough to name the boundary precisely in the
-README without overclaiming.
+**Answered 2026-10-17, and not from mstsc: the Client Info PDU.** The tap
+capture could not supply this - the MCS PDUs travel inside TLS 1.3 - so the
+answer comes from xrdp's sources plus a live probe against them:
+
+- MS-RDPBCGR 1.3.1.1 places the Secure Settings Exchange between the channel
+  join confirms and the Capabilities Exchange: the client sends the Client Info
+  PDU (TS_INFO_PACKET, 2.2.1.11); it gets nothing back but the server's
+  behaviour changes.
+- xrdp is the proof on the server side. `xrdp_sec_recv`
+  (libxrdp/xrdp_sec.c) dispatches each slow-path PDU on its TS_SECURITY_HEADER
+  flags, and only the `SEC_INFO_PKT` branch - which consumes the logon fields,
+  `xrdp_sec_process_logon_info` - calls `xrdp_sec_send_lic_response` and then
+  `return -1`, the special error `libxrdp_process_data` treats as "send the
+  Demand Active PDU". Anything else a client puts there falls out of the
+  dispatch and the server keeps waiting.
+- Measured: the probe sent one 296-octet Client Info PDU on the MCS global
+  channel (1003); xrdp logged `xrdp_load_keyboard_layout` (the logon fields
+  consumed) and answered with a 20-octet Licensing PDU and then a Demand Active
+  PDU carrying 14 capability sets. The client skipped the licensing PDU by
+  structure (`SEC_LICENSE_PKT` flag, `flagsHi == 0`, `wMessageSize` preamble)
+  and answered the Demand Active with a Confirm Active that produced no
+  `TS_CONFIRM_ACTIVE_PDU` error in `/var/log/xrdp.log`.
+
+The two theories this question already collected - a larger join count, then
+`RNS_UD_CS_SUPPORT_SKIP_CHANNELJOIN` - were both wrong, and AGENTS.md carries
+ their retraction. Neither join count nor skip flag makes xrdp talk; the
+Client Info PDU does.
 
 ## Method notes
 

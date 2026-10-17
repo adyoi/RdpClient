@@ -51,13 +51,16 @@ exists for IntelliSense; everything non-obvious is documented at the member.
 | GCC client data (`TS_UD_CS_*`) | 2.2.1.3 | **Verified against xrdp**; the blocks are accepted |
 | Erect Domain / Attach User / Channel Join | 2.2.1.5, 2.2.1.6, 2.2.1.8 | **Verified against xrdp**, and the Confirms are read |
 | RSA key exchange, session keys, MCS encryption | 5.3.2 | Not started |
-| Capability exchange | 2.2.7 | Not started |
-| Graphics and input | 2.2.8, 2.2.9 | Not started |
+| Client Info PDU, licensing skip | 1.3.1.1, 2.2.1.11 | **Verified against xrdp**; the Licensing PDU it triggers is skipped by structure |
+| Capability exchange | 2.2.7, 2.2.1.13 | **Verified against xrdp**: the Demand Active arrives and parses, the Confirm Active is answered without a server error |
+| Synchronize/Control/Font List, graphics and input | 2.2.9, 2.2.8 | Not started |
 
 Do not describe this as a working remote desktop client. It reaches TLS and
-authenticates nothing. Against xrdp it completes the MCS channel join, which is
-the honest stopping point: the next PDU is the Demand Active, and that starts
-the capability exchange.
+authenticates nothing. Against xrdp it now completes the capability exchange:
+the client sends the Client Info PDU, reads the Licensing and Demand Active
+PDUs, and answers with a Confirm Active xrdp accepts. The session still shows
+no desktop: the Synchronize, Control and Font List sequence and every graphics
+or input PDU are unimplemented.
 
 ## The client must read the server's answer
 
@@ -107,9 +110,10 @@ The log difference is unambiguous. With one join:
 ```
 
 That whole chain is the client being one join short, and it disappears with the
-full set. What remains is `libxrdp_force_read: header read error` in
-`libxrdp_process_data`, which is the normal data loop meeting a disconnect - the
-honest boundary before the Demand Active PDU.
+full set. The disconnect noise that follows is the normal data loop meeting a
+client exit, not a protocol fault: after the joins the client now sends the
+Client Info PDU and reads the Licensing and Demand Active PDUs, all the way
+through the capability exchange.
 
 `Expected N channel join PDUs but got N` is only a warning in xrdp, so its
 **absence** is the signal that the count matched. That is the check to make after
@@ -154,16 +158,26 @@ Confirm, and the next read is in `libxrdp_process_data`, which also blocks. So
 | --- | --- |
 | the 10 joins | the `force_read` after the last join, inside the join loop |
 | no joins, flag set | the first `force_read` in `libxrdp_process_data` |
+| either way, anything but the Client Info PDU | in `xrdp_sec_recv`: its TS_SECURITY_HEADER dispatch falls through, `libxrdp_process_data` loops on another read |
 
 Measured, not predicted: with the flag set the client logged
 `announced RNS_UD_CS_SUPPORT_SKIP_CHANNELJOIN (0800); sent no Channel Join
-Requests` and then waited, and xrdp's log gained nothing at all. xrdp has sent
-no Demand Active PDU under either strategy, so **what a client sends after the
-joins, and why, is still open**. Do not record it as answered.
+Requests` and then waited, and xrdp's log gained nothing at all. **The wait
+had a name all along: the Client Info PDU.** xrdp's `xrdp_sec_recv`
+dispatches each slow-path PDU on its TS_SECURITY_HEADER flags, and only the
+`SEC_INFO_PKT` branch - the Client Info PDU - calls
+`xrdp_sec_send_lic_response` and then `return -1`, the special error that
+means "send demand active" (libxrdp/xrdp_sec.c). Anything else falls out of
+the dispatch and the wait continues. This was recorded as open here for one
+round and is answered as of 2026-10-17; do not re-open it.
 
 What *is* settled: the joins themselves are right. Sending all ten clears
 xrdp's entire `ChannelJoinRequest failed` chain and the server logs
-`xrdp_load_keyboard_layout`, which it only does once the MCS sequence completes.
+`xrdp_load_keyboard_layout`, which it only does once the MCS sequence
+completes. Immediately after them the client sends the Client Info PDU on the
+global channel and reads a 20-octet Licensing PDU, which it skips by
+structure, and then the Demand Active. The password travels only inside the
+Client Info PDU, under TLS, and is never hex-logged.
 
 ### Bound every handshake
 
@@ -315,6 +329,25 @@ reason `docs/protocol.md` exists; read it before touching an encoder.
     the fragmentation field says the last one has arrived is fine until that
     field is misread, at which point the read never finishes and there is no
     diagnostic at all - a parse bug that presents as a hang.
+21. **A T.125 SendDataRequest/SendDataIndication userData length is an
+    X.691 length determinant, in both directions.** One octet at 127 octets and
+    below; above that two big-endian octets whose first is 0x8x and whose value
+    counts only the userData octets that follow, never the field itself. Writing
+    a plain little-endian u16 + 2 there desynchronised xrdp by exactly one byte:
+    the stray byte joined the security header it parsed next, the shifted flags
+    carried `SEC_EXCHANGE_PKT` (0x1), and the server answered
+    `xrdp_sec_recv : error - unexpected length 264448` - `0x00040900`, the
+    little-endian reading of four octets starting one position into the payload.
+22. **The Share Control Header's pduType is one little-endian u16 whose type is
+    in its four least significant bits.** The twelve bits above them are
+    PDUVersion, TS_PROTOCOL_VERSION = 0x1 (MS-RDPBCGR 2.2.8.1.1.1.1), so a
+    Demand Active is 0x0011 - `11 00` on the wire. xrdp reads it back with
+    `pdu_code & 0xf` and writes `0x10 | pdu_type`; FreeRDP writes `type | 0x10`.
+    Taking the type from the top bits made every real Demand Active read as
+    "type 0", and the matching builder bug passed its own round-trip test while
+    speaking a format no peer reads - the one-implementation trap again. A
+    `totalLength` of 0x8000 is not a Share Control Header at all: it introduces
+    a T.128 FlowPDU, which is skipped, not parsed.
 
 ## Section numbers, and a block that does not exist
 
