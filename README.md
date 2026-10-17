@@ -59,11 +59,10 @@ verified against a live server. Everything after channel join is not.
 | Layer | Spec | Status |
 | --- | --- | --- |
 | X.224 / T.125 connection request | — | **Done** |
-| RDP Negotiation (`RDP_NEG_REQ` / `RDP_NEG_RSP`) | 2.2.1.1 | **Done** |
+| RDP Negotiation (`RDP_NEG_REQ` / `RDP_NEG_RSP`) | 2.2.1.1, 2.2.1.2 | **Done** |
 | MCS Connect Initial / Connect Response | 2.2.1.3.4, 2.2.1.3.5 | **Verified against xrdp** |
-| GCC Conference Create Request / Response | 2.2.1.3.2, 2.2.1.3.3 | **Verified against xrdp** |
-| `TS_UD_CS_CORE` / `SECURITY` / `NET` / `CLUSTER` / `USER` | 2.2.1.3.4.1–.5 | Written; xrdp rejects them |
-| Erect Domain, Attach User, Channel Join | 2.2.1.3.6–.8 | Sent; replies not read yet |
+| GCC client data (`TS_UD_CS_*`) | 2.2.1.3.2–.5 | **Verified against xrdp** |
+| Erect Domain / Attach User / Channel Join | 2.2.1.5, .6, .8 | **Verified against xrdp**; replies parsed |
 | RSA key exchange, RC4 / AES session keys | 2.2.1.4.3, 5.3.2 | Not started |
 | TLS handshake for the External Security Protocol | MS-RDPEA 3.1.5.1 | **Works** (verified) |
 | CredSSP / NLA — SPNEGO + NTLM | MS-NLMP, MS-RDPEA | Incomplete |
@@ -78,11 +77,14 @@ client stops there and says why. Windows also refuses `PROTOCOL_SSL` on its own
 with failure code 5, `SSL_REQUIRED_BY_SERVER`, because it wants NLA, so that host
 cannot exercise anything past TLS.
 
-Against **xrdp** the client goes further: the MCS Connect-Initial is accepted,
-the Connect-Response comes back and is parsed, and the client reports the user id
-the server assigned (31219). xrdp then rejects the `TS_UD_CS_*` client data
-blocks, which is the next defect. See [the changelog](CHANGELOG.md) for exactly
-what is verified and what is not.
+Against **xrdp** the client now completes the whole MCS channel join: the server
+parses the Connect Initial and its client data blocks, answers the Connect
+Response, attaches the user, and accepts the channel join of the MCS global
+channel 1003. Both server replies are read and parsed, so the reported result
+reflects what the server actually said. The next PDU in the exchange is the
+Demand Active, which begins the capability exchange - see
+[the changelog](CHANGELOG.md) for the byte-level record and
+[the xrdp log excerpt](docs/wsl-rdp-lab.md#10-read-the-servers-log-before-theorising).
 
 ### What stands between this and the login screen
 
@@ -189,20 +191,21 @@ Against **xrdp** (`--tls-only`, port 3390) the client gets through MCS, which is
 what makes that server worth having:
 
 ```text
-18:44:52.822  info    sent MCS Connect Initial (137 bytes)
-18:44:53.229  info    MCS accepted (conference 0), UserID 31219, ServerNodeID 31219
-18:44:53.229  info    sent Erect Domain Request (8 bytes)
-18:44:53.229  info    sent Attach User Request, UserID 1001
-18:44:53.230  info    joined MCS global channel 1007
+18:55:05.168  info    negotiated version 0x00000001, SelectedProtocol 0x00000001
+18:55:05.273  info    Tls13, subject 'CN=runnervm0xl3a.localdomain' (self-signed certificate accepted; ...)
+18:55:05.290  info    sent MCS Connect Initial (561 bytes)
+18:55:05.290  info    MCS accepted (conference 0), UserID 31219, ServerNodeID 31219
+18:55:05.453  info    sent Erect Domain Request (12 bytes)
+18:55:05.453  info    sent Attach User Request (8 bytes)
+18:55:05.497  info    attached as MCS user 1012
+18:55:05.497  info    joined MCS channel 1003
 
 RESULT: MCS channel joined.
 ```
 
-xrdp accepts the Connect-Initial and then rejects the `TS_UD_CS_*` client data
-blocks inside it, logging
-`Not enough bytes in the stream: expected 32764, remaining 308`. That is the next
-defect, and it is the reason the MCS rows above are marked "verified against
-xrdp" rather than "done".
+Those last two lines are read from the server's own Confirm PDUs, not assumed.
+The session then stops, because the next PDU is the Demand Active and the
+capability exchange is not implemented - so no desktop is displayed.
 
 ## Project layout
 
@@ -235,10 +238,20 @@ docs/                   Protocol notes, research, architecture
 
 ## Security
 
-This client sends credentials as UTF-16 in `TS_UD_CS_USER` **in the clear** over the classic RDP
-handshake. On any untrusted network that is unacceptable. CredSSP/NLA is not implemented yet for
-exactly this reason — until it is, only use this against hosts you control or over a trusted,
-encrypted transport.
+The classic-RDP user data block sends a password as UTF-16 **in the clear**.
+MS-RDPBCGR does not define that block at all - it predates the specification,
+and xrdp answers `TS_UD_HEADER type 0xc00e is unknown (ignored)` - so it is off
+by default and reachable only through the explicit `--classic-user` flag or the
+`SendClassicUserBlock` option.
+
+Even where a server accepts it, on any untrusted network that is unacceptable.
+CredSSP/NLA is not implemented yet for exactly this reason — until it is, only use
+this against hosts you control or over a trusted, encrypted transport.
+
+The TLS certificate is accepted unconditionally, because an RDP host presents a
+self-signed certificate issued for `TERMSRV/<host>` and RDP does not
+chain-validate it. The handshake log reports the subject and issuer of whatever
+was accepted.
 
 ## Contributing
 

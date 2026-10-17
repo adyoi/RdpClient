@@ -190,35 +190,102 @@ The response side mirrors it, and carries one more trap: the `connectPDU`
 length in a Conference Create Response **must be ignored**. Servers do not agree
 on what it counts, so a client that trusts it desynchronises.
 
-## 4. Client data blocks (2.2.1.3.4.1–.5)
+## 4. Client data blocks (2.2.1.3.2–.5)
 
-`TS_UD_CS_NET`, `TS_UD_CS_CLUSTER` and `TS_UD_CS_USER` share a 6-byte TLV
-header:
+Every block begins with the same **4-byte** `TS_UD_HEADER` (2.2.1.3.1):
 
 ```text
-type (2) | flags (2) | length (2) | payload
+type (2) | length (2)
 ```
+
+There is **no flags field**, and `TS_UD_CS_CORE` carries this header too - it is
+not the one block that lacks one. Three properties of the header cause
+disagreement between implementations:
+
+| Property | Rule |
+| --- | --- |
+| Endianness | plain little-endian 16-bit count |
+| Scope | **the whole block, header included** |
+| PER marker | **none.** No `0x8000` marker appears here |
 
 The discriminator is 16-bit. `TS_UD_CS_NET` is `0xC003`, which appears on the
 wire as `03 C0`; writing it as a single byte leaves it as `03` and shifts every
 following field by one.
 
-`TS_UD_CS_CORE` has no TLV header. Two of its fields are fixed-width and are
-NUL-padded rather than length-prefixed:
+Sizes, from MS-RDPBCGR:
+
+| Block | Tag | Total |
+| --- | --- | --- |
+| `TS_UD_CS_CORE` | `0xC001` | 234 |
+| `TS_UD_CS_SEC` | `0xC002` | 12 |
+| `TS_UD_CS_NET` | `0xC003` | `12 * channelCount + 8` |
+| `TS_UD_CS_CLUSTER` | `0xC004` | 12 |
+
+`CHANNEL_DEF` (2.2.1.3.4.1) is exactly 12 octets - an 8-octet name and a 4-octet
+options mask - with **no length prefix of its own**.
+
+Three fixed-width fields inside CORE are NUL-padded rather than length-prefixed:
 
 | Field | Size |
 | --- | --- |
-| `ClientName` | 32 bytes (16 UTF-16 units) |
+| `clientName` | 32 bytes (16 UTF-16 units) |
 | `imeFileName` | 64 bytes (32 UTF-16 units) |
+| `clientDigProductId` | 64 bytes (32 UTF-16 units) |
 
-`TS_UD_CS_USER` field lengths are **byte** counts, so a 5-character user name
-is declared as 10.
+**There is no `TS_UD_CS_USER` in MS-RDPBCGR.** It is a classic-RDP structure
+that predates the specification; xrdp answers
+`TS_UD_HEADER type 0xc00e is unknown (ignored)`. Its field lengths are byte
+counts, so a 5-character user name is declared as 10 - which is the one property
+of it worth keeping.
 
-## 5. MCS channel setup (2.2.1.3.6–.8)
+### Why a wrong length is so expensive
 
-After Connect Response the client erects the server domain, attaches itself as
-a user, and joins the MCS global channel (1007). Payload framing for later data
-uses MCS Send Data Request, chunked at 1598 bytes.
+A reader walks the declared length to find the next block. Declaring less than
+is sent does not produce a parse error, it silently desynchronises everything
+after it. xrdp makes this explicit by logging the expected and remaining
+counts:
+
+```text
+[ERROR] Parsing [MS-RDPBCGR] GCC Conference Create Request client data field
+        Not enough bytes in the stream: expected 32764, remaining 308
+```
+
+## 5. MCS channel setup (2.2.1.5, 2.2.1.6, 2.2.1.8)
+
+Each of these is a T.125 DomainMCSPDU, and each is framed the same way:
+
+```text
+TPKT header (4) | X.224 Data TPDU (3) | opcode (1) | fields
+```
+
+The annotated PDUs in MS-RDPBCGR give the bytes exactly:
+
+```text
+Erect Domain      03 00 00 0c | 02 f0 80 | 04 01 00 01 00
+Attach User       03 00 00 08 | 02 f0 80 | 28
+Channel Join      03 00 00 0c | 02 f0 80 | 38 <initiator:2> <channelId:2>
+```
+
+Two things about the opcode octet are easy to get wrong:
+
+- **It is not the PDU code.** It is the DomainMCSPDU CHOICE index in the top
+  six bits, with two option bits below: `opcode = (choice << 2) | options`.
+  Erect Domain is choice 1, so `0x04`. Reading `0x05` as "the code" lands on a
+  different PDU entirely.
+- **The subHeight and subInterval in Erect Domain are PER integers**, so a zero
+  is the two octets `01 00`, not a bare `00`.
+
+The `initiator` of a Channel Join Request is the user id from the **Attach User
+Confirm**, written as a PER integer relative to 1001. A conventional 1001 is not
+a substitute: the server rejects a join whose initiator is not the user it
+attached. This is the one field in the exchange the client cannot know in
+advance, so the Confirm must be read before the join can be built.
+
+The global channel is **1003**, not 1007 - the latter is the H.225.0 RTP channel
+number.
+
+Payload framing for later data uses MCS Send Data Request, chunked at 1598
+bytes, inside the same TPKT + X.224 envelope.
 
 ## Reference implementation
 

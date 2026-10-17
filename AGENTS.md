@@ -47,14 +47,49 @@ exists for IntelliSense; everything non-obvious is documented at the member.
 | TLS handshake | MS-RDPEA 3.1.5.1 | Verified, TLS 1.2 and 1.3 |
 | CredSSP `TSRequest` envelope | MS-CSSP 2.2.1 | **Encoded and verified structurally**; host now parses it |
 | SPNEGO + NTLM | MS-NLMP | **Not working**, host returns `SEC_E_INVALID_TOKEN` |
-| MCS Connect Initial / Response | 2.2.1.3.4, 2.2.1.3.5 | **Verified against xrdp**; reaches the GCC client data |
-| GCC client data (`TS_UD_CS_*`) | 2.2.1.3.4.1 | xrdp rejects the blocks the client builds today |
+| MCS Connect Initial / Response | 2.2.1.3.4, 2.2.1.3.5 | **Verified against xrdp** |
+| GCC client data (`TS_UD_CS_*`) | 2.2.1.3 | **Verified against xrdp**; the blocks are accepted |
+| Erect Domain / Attach User / Channel Join | 2.2.1.5, 2.2.1.6, 2.2.1.8 | **Verified against xrdp**, and the Confirms are read |
 | RSA key exchange, session keys, MCS encryption | 5.3.2 | Not started |
 | Capability exchange | 2.2.7 | Not started |
 | Graphics and input | 2.2.8, 2.2.9 | Not started |
 
 Do not describe this as a working remote desktop client. It reaches TLS and
-authenticates nothing.
+authenticates nothing. Against xrdp it completes the MCS channel join, which is
+the honest stopping point: the next PDU is the Demand Active, and that starts
+the capability exchange.
+
+## The client must read the server's answer
+
+**A stage is not complete until the reply has been read and parsed.** The
+original code sent the Erect Domain, Attach User and Channel Join requests and
+then reported `Complete` without reading a single reply, so a server that had
+rejected the first PDU was still reported as a completed channel join. That is
+the most expensive class of defect in this repository: it makes a broken
+connection look like a working one.
+
+`AttachUserConfirm` is not optional bookkeeping. It is the **only** place the
+server states which user id it assigned, and the Channel Join Request must
+carry that id. A conventional 1001 is not a substitute.
+
+xrdp reports the same failure from the other side, so the two have to be read
+together:
+
+```text
+client: joined MCS channel 1003
+xrdp:   [ERROR] Processing [ITU-T T.25] ChannelJoinRequest failed
+        [ERROR] libxrdp_force_read: header read error
+```
+
+## Reading the channel join
+
+`expecting_channel_join_requests` is set after the Attach User Confirm in xrdp,
+and its comment says "zero or more channel join requests are expected at this
+point". A client that joins only the MCS global channel and then stops gets one
+`ChannelJoinRequest` accepted and a second read that hits EOF. Seeing exactly
+that pair - one accepted join, then a read error on the *next* join - means the
+framing is right and the session simply ended early, which is what happens
+before the capability exchange exists.
 
 Windows refuses `PROTOCOL_SSL` alone with failure code 5,
 `SSL_REQUIRED_BY_SERVER`, because it wants NLA. So the Windows host cannot
@@ -100,45 +135,76 @@ reason `docs/protocol.md` exists; read it before touching an encoder.
    `li` to locate a following structure; skip the fixed header instead.
 3. **`TS_UD_CS_*` discriminators are 16-bit.** `TS_UD_CS_NET` is `0xC003` and
    appears as `03 C0`. Writing it as one byte shifts every following field.
-4. **`NET`, `CLUSTER` and `USER` carry a 6-byte TLV header**: type(2),
-   flags(2), length(2). `CORE` has no TLV header and two fixed-width
-   NUL-padded fields.
-5. **The MCS Connect-Initial is ASN.1, not a flat TLV.** It is
+4. **The `TS_UD_HEADER` is 4 bytes: type(2), length(2). There is no flags
+   field.** Every client data block starts with one, `TS_UD_CS_CORE` included.
+   CORE is not the exception it was long taken to be; writing six octets where
+   four belong shifts every payload field by two.
+5. **A `TS_UD_HEADER.length` covers the whole block, header included.** It is a
+   plain little-endian 16-bit count with **no** `0x8000` PER marker - that
+   marker belongs to the PER lengths around the GCC data and to nothing else
+   here. A reader walks the length to find the next block, so a block that
+   declares less than it sends desynchronises everything after it. `NET` is
+   `12 * channelCount + 8`, because CHANNEL_DEF is a fixed 12 octets with no
+   length prefix of its own.
+6. **A MCS domain PDU is TPKT + X.224 Data TPDU + one opcode octet**, in that
+   order. Erect Domain, Attach User and Channel Join all travel in that
+   envelope, and sending them bare produces no diagnostic at all.
+7. **That opcode octet is not the PDU code.** It is the T.125 DomainMCSPDU
+   CHOICE index in the top six bits with two option bits below:
+   `opcode = (choice << 2) | options`. Erect Domain is choice 1, so the octet is
+   `0x04`, not `0x05`. Reading the octet as the code lands on a different PDU.
+8. **The MCS global channel is 1003**, not 1007. 1007 is the H.225.0 RTP channel
+   number and has no business in an MCS channel list.
+9. **The MCS Connect-Initial is ASN.1, not a flat TLV.** It is
    `Connect-Initial ::= [APPLICATION 101] IMPLICIT SEQUENCE` carrying two domain
    selectors, an upward flag, three sets of domain parameters and the user data.
    101 does not fit the five tag bits of one octet, so the identifier is
    **`7f 65`**. Writing it as a length-prefixed TLV gets `expected 0x7f65,
    actual 0x0300` out of xrdp - which is how the mistake was found.
-6. **The conference name inside it is a PER numeric string, digits only.**
+10. **The conference name inside it is a PER numeric string, digits only.**
    Two digits pack to an octet, `(d1 << 4) | d2`, with an implied trailing `0`
    on an odd length, so the name `"1"` is the octet **`0x10`** and not `0x01`.
    `McsCnxn` is not a conference name: it is the H.221 node label from the older
    T.125 CCPDU, and it cannot be encoded as a numeric string at all.
-7. **A PER length is not a BER length.** Under 128 it is one octet. Above it the
-   high bit is set and the full two-octet value is kept big-endian, rather than
-   the high bit counting the octets that follow the way BER does. In a
-   Conference Create Response the `connectPDU` length must be **ignored
-   entirely** - servers disagree on what it counts.
-8. **Skip the TPKT header before parsing the X.224 envelope.** Reading at
+11. **A PER length is not a BER length.** Under 128 it is one octet. Above it the
+    high bit is set and the full two-octet value is kept big-endian, rather than
+    the high bit counting the octets that follow the way BER does. In a
+    Conference Create Response the `connectPDU` length must be **ignored
+    entirely** - servers disagree on what it counts - but it still occupies one
+    or two octets, so it has to be stepped over as a variable-width field
+    rather than skipped as a single octet.
+12. **Skip the TPKT header before parsing the X.224 envelope.** Reading at
    offset 0 of a TPKT datagram takes `0x03`, the TPKT version, as if it were the
    MCS result. That is the origin of a whole family of phantom
    "connection refused" reports. The X.224 Data TPDU is length indicator, DT
    code, EOT - so the DT code is the *second* octet.
-9. **A CredSSP `TSRequest` field declared `[n] INTEGER` wraps a whole INTEGER
+13. **A CredSSP `TSRequest` field declared `[n] INTEGER` wraps a whole INTEGER
    TLV.** `version` is `a0 03 02 01 06`, not `a0 01 06`. The second declares one
    content byte holding a bare `0x06`, which is not a valid INTEGER, so the
    whole request stops being valid DER.
-10. **An NTLM field descriptor is `{ Length(2), MaxLen(2), BufferOffset(4) }`.**
+14. **An NTLM field descriptor is `{ Length(2), MaxLen(2), BufferOffset(4) }`.**
    The offset is 32-bit. Reading Length from `[4..6]` and Offset from `[6..8]`
    takes the two halves of the offset instead, which silently yields the offset
    as the length and zero as the offset.
-11. **A structure must be as long as the length field it declares.** The NTLM
+15. **A structure must be as long as the length field it declares.** The NTLM
    `BufferOffset` above is 4 octets and had to be written as 4. Likewise
    `RDP_CORRELATION_INFO` declares 36 while its named fields occupy 24, so the
    block is padded. xrdp walks the declared length and aborts with
    `Not enough bytes in the stream: expected 35, remaining 23`; Windows ignores
    the discrepancy, so only a second implementation catches this class of
    defect.
+
+## Section numbers, and a block that does not exist
+
+Several references were wrong long enough to hide the defects above:
+
+- The MCS connection PDUs are **2.2.1.5, 2.2.1.6 and 2.2.1.8**, not
+  2.2.1.3.6-8, which are the client data blocks.
+- `TS_UD_CS_CLUSTER` is **2.2.1.3.5**, not 2.2.1.3.4.4.
+- **`TS_UD_CS_USER` does not exist in MS-RDPBCGR.** xrdp answers
+  `TS_UD_HEADER type 0xc00e is unknown (ignored)`. It is a classic-RDP
+  structure that predates the specification, it puts a password on the wire in
+  UTF-16 in the clear, and it is opt-in here rather than sent by default.
 
 ## A second server is how encoding bugs get caught
 

@@ -7,8 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-The CredSSP envelope, which was missing entirely, plus three encoding defects
-found by diffing against a working reference implementation.
+The CredSSP envelope, which was missing entirely, plus the MCS client data and
+channel-setup encodings, which xrdp rejected outright. The connection now
+completes the MCS channel join against xrdp, and reports only what the server
+actually confirmed.
 
 ### Added
 
@@ -18,59 +20,80 @@ found by diffing against a working reference implementation.
   actionable. The password is never in the log and never in the copy; the
   authenticator's protocol hex is, so the button says so in its tooltip.
   `Clear` existed in the view model but had no way to be pressed.
+- **`SendClassicUserBlock`** exposes the classic-RDP user data block, off by
+  default. See the security note below.
+- **Parsing for the server's replies.** `AttachUserConfirm` and
+  `ChannelJoinConfirm` are read and interpreted, and the client stops with the
+  server's reason when either refuses.
 
 ### Fixed
 
-- **The MCS Connect-Initial was encoded as a flat TLV rather than as ASN.1.**
-  It is T.125's `Connect-Initial ::= [APPLICATION 101] IMPLICIT SEQUENCE`,
-  holding two domain selectors, an upward flag, three sets of domain parameters
-  and the user data. 101 does not fit the five tag bits of one octet, so the
-  identifier is written `7f 65`; the TLV this client produced began `03 00`, and
-  xrdp named the difference:
+- **The client reported success it had not verified.** This was the most
+  serious defect in the project. The Erect Domain, Attach User and Channel Join
+  requests were written and `ConnectAsync` returned `Complete` without reading
+  a single reply, so the CLI printed `RESULT: MCS channel joined.` against a
+  server that had rejected the first PDU. xrdp's log at the time reads:
 
   ```text
-  [ERROR] Parsed [ITU-T X.690] Identifier: expected 0x7f65, actual 0x0300
+  [ERROR] Parsing [MS-RDPBCGR] GCC Conference Create Request client data field
+          Not enough bytes in the stream: expected 32764, remaining 308
+  [ERROR] Processing [ITU-T T.125] ErectDomainRequest failed
+  [ERROR] [MCS Connection Sequence] receive erect domain request failed
   ```
 
-  The user data inside it is the GCC Conference Create Request, encoded with
-  T.125's ALIGNED variant of BASIC-PER rather than as a TLV. `Asn1` now holds
-  the primitives both need, including the two that differ from the rest of RDP:
-  BER INTEGERs are big-endian and sign-padded (`0xFFFF` becomes `00 FF FF`), and
-  a PER length above 127 keeps a two-octet big-endian value with the high bit
-  set instead of counting the octets that follow.
-- **"MCS Connect Response result 3: connection refused" was a misread TPKT
-  octet.** The response was parsed as a TLV starting at offset 0 of the whole
-  TPKT datagram, so the byte read as the MCS result was `0x03` - the TPKT
-  version. No server in this repository ever refused anything there. Two further
-  errors sat behind it: the Connect-Response is `[APPLICATION 102]` (`7f 66`)
-  and was being matched against nothing, and the X.224 check compared the
-  length indicator against the DT code rather than the code itself.
-- **The conference name was `McsCnxn`.** That is the H.221 node label from the
-  older T.125 CCPDU, not a conference name, and PER encodes the name as a numeric
-  string - digits only, two per octet. The name `"1"` is therefore the octet
-  `0x10`, not `0x01`. The `GccConferenceLabel` constant is removed; nothing in
-  the Connect-Initial carries a label.
-
-  Verified against xrdp 0.10.1, which now parses the Connect-Initial, answers
-  with a Connect-Response assigning UserID 31219, and moves on to the GCC client
-  data - one stage further than before. It rejects those blocks, which is the
-  next thing to fix.
-
+  Every stage now waits for the reply that proves it. The Attach User Confirm is
+  not optional bookkeeping: it is the only place the server states the user id
+  it assigned, and the Channel Join Request has to carry that id.
+- **The `TS_UD_HEADER` was 6 bytes instead of 4.** MS-RDPBCGR 2.2.1.3.1 defines
+  it as type(2) and length(2) with **no flags field**, and every client data
+  block carries one. Writing an extra flags octet shifted every payload field by
+  two.
+- **`TS_UD_CS_CORE` was written as though it had no header at all.** It has one
+  like every other block, which is what left it 36 octets short of the 234 the
+  specification lays out. The missing octets were the header, the 64-byte
+  `clientDigProductId` (written as a 4-byte field), and the trailing
+  orientation and scale factors. Two fields that do not exist in the structure -
+  `clientColorDepth` and `clientPostBeta2ColorDepth` - were written in their
+  place. CORE is now the 234-octet block a real client sends, pinned against
+  FreeRDP's `gcc_write_user_data_header(s, CS_CORE, 234)`.
+- **Every declared `TS_UD_HEADER.length` covered only a fixed portion.** The
+  length is the size of the whole block including the header, and a reader walks
+  it to find the next block, so declaring less than is sent desynchronises
+  everything after it with no diagnostic. `NET` declared 8 while sending 114.
+  Lengths are now patched after the payload is written, so the two cannot drift
+  apart again.
+- **`CHANNEL_DEF` was written with a spurious length prefix.** It is a fixed
+  12-octet structure - an 8-octet name and a 4-octet options mask - with no
+  length octet, so every channel entry was 13 bytes and `NET` was 8 bytes longer
+  than the count it declared. It is now `12 * channelCount + 8`.
+- **The MCS domain PDUs were sent bare.** Erect Domain, Attach User and Channel
+  Join are T.125 DomainMCSPDUs and each travels in TPKT + X.224 Data TPDU, as
+  the annotated PDUs in MS-RDPBCGR 4.1.5 and 4.1.6 show. Sent bare, xrdp could
+  not find a TPKT header at all.
+- **The opcode octet was the PDU code rather than the shifted CHOICE index.**
+  It is `(choice << 2) | options`, with the choice in the top six bits. Erect
+  Domain is choice 1 and so is `0x04`, not `0x05`. The old values came from a
+  different numbering in MS-RDPBCGR 3.3.5.2 and landed on unrelated PDUs.
+- **Erect Domain wrote its two fields as raw values rather than PER integers.**
+  A zero is the two octets `01 00`, because a PER integer carries its own length
+  determinant.
+- **The MCS global channel was 1007.** It is **1003**; 1007 is the H.225.0 RTP
+  channel number, and a client that joins it joins a channel no server created.
+- **The Connect Response walk skipped the ignored `connectPDU` length as a
+  single octet.** It must be ignored as a *value* but still occupies one or two
+  octets, so it is now stepped over as a variable-width PER field.
 - **`RDP_CORRELATION_INFO` was shorter than the length it declared.** The block
   declares 36 octets but only the 24 named fields were sent. Windows tolerates
-  that; xrdp walks the declared length, fails with `Not enough bytes in the
-  stream: expected 35, remaining 23`, and drops the connection before
-  negotiation. The block is now padded, and `Negotiation.CorrelationInfoLength`
-  records the value. Verified against both: xrdp goes from a 9-byte
-  `DisconnectProviderUltimatum` to a Connection Confirm selecting
-  `PROTOCOL_SSL` and a completed TLS 1.3 handshake, while the Windows host is
-  unchanged. A capture of `mstsc.exe` shows it never sends this block, which is
-  why the defect survived: nothing in the Windows path exercises the encoding.
+  that; xrdp walks `1 + 2 + 16 + 16` octets after the type and aborts the
+  connection before negotiation. The block is now padded, and
+  `Negotiation.CorrelationInfoLength` records the value. A capture of
+  `mstsc.exe` shows it never sends this block, which is why the defect survived:
+  nothing in the Windows path exercises the encoding.
 - **The NTLM field-descriptor offset was written as 16 bits.** Each descriptor
   is `{ Length(2), MaxLen(2), BufferOffset(4) }`, so the BufferOffset occupies
   four octets, exactly as `ReadField` reads it. The writer emitted only two, and
   a BufferOffset above 65535 would have been truncated without the reader ever
-  noticing. Both the AUTHENTICATE and the NEGOTIATE encoders now write four.
+  noticing.
 - **`Slice` could overflow while checking a bounds offset.** The check added
   `offset + length` in 32-bit arithmetic, which wraps for a large offset and can
   pass a slice the message cannot contain. The bounds are now compared without
@@ -104,8 +127,23 @@ found by diffing against a working reference implementation.
 - `NEGOTIATE_VERSION` was set while the 8-octet Version field at offset 32 was
   left all zero, which is not a valid version.
 
+### Security
+
+- **The classic-RDP user data block is no longer sent by default.** It puts a
+  password on the wire in UTF-16 in the clear, and MS-RDPBCGR does not define it
+  at all - xrdp answers `TS_UD_HEADER type 0xc00e is unknown (ignored)`, so the
+  client was transmitting a credential the server was about to discard.
+  `SendClassicUserBlock` makes it opt-in, which is the point at which the
+  README's warning about cleartext credentials applies.
+- `TS_UD_CS_CORE` reported zero physical desktop dimensions, which is invalid
+  rather than merely ignored: xrdp logged
+  `Physical desktop dimensions (0x0) are invalid` and sized the session window
+  to nothing. It now reports a 4:3 desktop in millimetres.
+
 ### Changed
 
+- The MCS global channel is joined as **1003**, and the join is only reported
+  complete once the server's Channel Join Confirm has been read.
 - Authentication traces what it sends and receives, so a failure names the stage
   and the token type instead of surfacing as a flattened TLS error.
 - The exchange now advances. The host accepts the NEGOTIATE and returns an NTLM
@@ -113,13 +151,30 @@ found by diffing against a working reference implementation.
 - Tests are pinned to captured bytes rather than to hand-typed hex: the CHALLENGE
   fixture is written to `Fixtures/challenge.bin` from a live run.
 
+### Verified
+
+Against xrdp 0.10.1 in WSL (Debian 13, port 3390, `--tls-only`):
+
+```text
+negotiated version 0x00000001, SelectedProtocol 0x00000001
+Tls13, subject 'CN=runnervm0xl3a.localdomain' (self-signed certificate accepted)
+sent MCS Connect Initial (561 bytes)
+MCS accepted (conference 0), UserID 31219, ServerNodeID 31219
+sent Erect Domain Request (12 bytes)
+sent Attach User Request (8 bytes)
+attached as MCS user 1012
+joined MCS channel 1003
+```
+
+xrdp's log for the same run contains no parse error and no unknown block; the
+first MCS-related line is the Channel Join reading the client's next request and
+hitting the client's own disconnect, which is the boundary before the
+capability exchange exists.
+
 ### Known issue
 
-The protocol path is not known broken. **NTLM authentication completes**: the
-server accepts the AUTHENTICATE and answers `STATUS_LOGON_FAILURE`
-(`0xC000006D`) where it used to answer `SEC_E_INVALID_TOKEN` (`0x80090308`).
-The remaining failure is a credential or a channel-binding question, not a
-malformed PDU.
+NTLM authentication against a Windows host reaches `STATUS_LOGON_FAILURE`, and
+NTLM is not exercised against xrdp, which does not offer CredSSP here.
 
 - **MD4 was wrong in three separate ways**, and a wrong NT hash makes *every*
   password fail with `STATUS_LOGON_FAILURE`, which is indistinguishable from a
