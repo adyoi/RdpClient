@@ -15,7 +15,7 @@ description: >-
 Publish per runtime, never per solution platform:
 
 ```powershell
-dotnet test                                       # 69 tests, must be green first
+dotnet test                                       # 104 tests, must be green first
 dotnet publish src/RdpClient.Cli\RdpClient.Cli.csproj -c Release -r win-x64 --self-contained true -o artifacts\rdpprobe\win-x64
 dotnet publish src\RdpClient\RdpClient.csproj       -c Release -r win-x64 --self-contained true -o artifacts\app\win-x64
 ```
@@ -60,7 +60,8 @@ bytes, not in an error message.
 
 ## Invariants
 
-Violating any of these causes an immediate reset.
+Violating any of these causes an immediate reset, or a silent
+desynchronisation that looks like a server bug.
 
 - **TPKT length is big-endian.** The only big-endian field in the sequence.
 - **X.224 order: length indicator, then TPDU code.** TPKT puts its length last.
@@ -68,11 +69,53 @@ Violating any of these causes an immediate reset.
   regardless of content; skip the fixed header (code, 2-byte dst, 2-byte src,
   class option) instead.
 - **`TS_UD_CS_*` discriminators are 16-bit**, `03 C0` on the wire for `0xC003`.
-- **`NET` / `CLUSTER` / `USER` have a 6-byte TLV header**: type(2), flags(2),
-  length(2). `CORE` has none and carries two fixed-width NUL-padded fields.
-- **The GCC conference name length is in UTF-16 code units.** `McsCnxn` is 7
-  characters, 14 bytes.
-- **MCS integers are plain fixed-width values** with no T.125 selector bits.
+- **The `TS_UD_HEADER` is 4 bytes: type(2), length(2). There is no flags
+  field.** Every client data block has one, `TS_UD_CS_CORE` included. `CORE`
+  is not the exception it looks like in older notes.
+- **A `TS_UD_HEADER.length` covers the whole block, header included**, and is a
+  plain little-endian count with **no** `0x8000` PER marker. Patch it in after
+  the payload is written. `NET` is `12 * channelCount + 8`, because
+  `CHANNEL_DEF` is a fixed 12 octets with no length prefix of its own.
+- **Every MCS domain PDU is TPKT + X.224 Data TPDU + one opcode octet.** Erect
+  Domain, Attach User and Channel Join all travel in that envelope. Sending
+  them bare gets no diagnostic at all.
+- **The opcode octet is not the PDU code.** It is the T.125 DomainMCSPDU
+  CHOICE index in the top six bits with two option bits below:
+  `opcode = (choice << 2) | options`. Erect Domain is `0x04`, not `0x05`.
+- **The MCS global channel is 1003**, not 1007. 1007 is the H.225.0 RTP channel
+  number.
+- **The Channel Join initiator is the user id from the Attach User Confirm**,
+  written as a PER integer relative to 1001. Not a hard-coded 1001.
+- **The GCC conference name is a PER numeric string**, digits only. `McsCnxn`
+  is the H.221 node label and cannot be encoded as one at all.
+- **MCS integers are plain fixed-width values** with no T.125 selector bits,
+  except where a field is a PER INTEGER, which carries its own length
+  determinant: a zero is `01 00`, not a bare `00`.
+
+## Read the reply before calling a stage done
+
+The single most expensive defect class in this project. An earlier version
+sent the Erect Domain, Attach User and Channel Join requests, read **none** of
+the replies, and returned `Complete` - so `rdpprobe` printed
+
+```text
+RESULT: MCS channel joined.
+```
+
+against a server that had rejected the very first PDU:
+
+```text
+[ERROR] Parsing [MS-RDPBCGR] GCC Conference Create Request client data field
+        Not enough bytes in the stream: expected 32764, remaining 308
+[ERROR] Processing [ITU-T T.125] ErectDomainRequest failed
+```
+
+A client that cannot distinguish a refused connection from an accepted one
+cannot be diagnosed at all. Every stage waits for the PDU that proves it.
+
+Note that `TS_UD_CS_USER` does not exist in MS-RDPBCGR; xrdp answers
+`TS_UD_HEADER type 0xc00e is unknown (ignored)`. Sending it by default
+transmitted a cleartext password the server was about to discard.
 
 ## Using the decompiler
 

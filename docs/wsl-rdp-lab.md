@@ -184,19 +184,41 @@ the same server with this repository's own tool:
 dotnet run --project src/RdpClient.Cli -- --host $ip --port 3390 --tls-only
 ```
 
-A healthy run reaches TLS and then stops at MCS, because xrdp requires
-credentials that this client cannot present yet:
+A healthy run reaches MCS and completes the channel join:
 
 ```text
 negotiated version 0x00000001, SelectedProtocol 0x00000001
-External Security Protocol: TLS
 Tls13, subject 'CN=...' (self-signed certificate accepted; ...)
-sent MCS Connect Initial (355 bytes)
-MCS refused the connection: MCS Connect Response result 3: connection refused
+sent MCS Connect Initial (561 bytes)
+MCS accepted (conference 0), UserID 31219, ServerNodeID 31219
+sent Erect Domain Request (12 bytes)
+sent Attach User Request (8 bytes)
+attached as MCS user 1012
+joined MCS channel 1003
+
+RESULT: MCS channel joined.
 ```
 
-`result 3` is the expected end of this stage and not a defect. Anything earlier
-in that output is a real finding.
+The last two lines are read from the server's own Confirm PDUs rather than
+assumed, and they name the id the server assigned. The session then stops,
+because the next PDU is the Demand Active and the capability exchange is not
+implemented. xrdp's log will show it hitting the client's disconnect while
+reading the *next* channel join:
+
+```text
+[ERROR] libxrdp_force_read: header read error
+[ERROR] Processing [ITU-T T.25] ChannelJoinRequest failed
+```
+
+One accepted join followed by a read error on the next one is the expected end
+of this stage. Anything earlier in the output is a real finding, as is any
+`GCC Conference Create Request client data field` error or any
+`TS_UD_HEADER type ... is unknown` line.
+
+**An earlier version printed `MCS Connect Response result 3: connection
+refused` here.** That was a misread TPKT octet rather than a refusal: the
+parser started at offset 0 of the datagram and read the TPKT version `0x03` as
+the MCS result. Suspect the parser before the server.
 
 ## 10. Read the server's log before theorising
 

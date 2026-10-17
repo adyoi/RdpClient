@@ -43,8 +43,12 @@ connection reset:
 1. The TPKT length is **big-endian**. Everything else is little-endian.
 2. X.224 puts the **length indicator before** the TPDU code. TPKT puts its
    length last.
-3. `TS_UD_CS_*` discriminators are **16-bit**, and the `NET` / `CLUSTER` /
-   `USER` blocks carry a 6-byte TLV header.
+3. `TS_UD_CS_*` discriminators are **16-bit**, and every client data block
+   begins with the same **4-byte** `TS_UD_HEADER` - type and length, with no
+   flags field. The length covers the whole block, so it has to be patched
+   once the payload is written.
+4. A stage is not finished until the server's reply to it has been read and
+   parsed. Sending a PDU successfully is not evidence that it was accepted.
 
 `docs/protocol.md` has the field tables and the reasoning.
 

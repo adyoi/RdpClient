@@ -63,9 +63,20 @@ domain-attach / user-attach / channel-join PDUs.
 
 ### `ClientPdu.cs`
 
-`TS_UD_CS_CORE`, `SECURITY`, `NET`, `CLUSTER` and `USER`. `NET`, `CLUSTER` and
-`USER` share a 6-byte TLV header; `CORE` has none and carries two fixed-width
-NUL-padded fields.
+`TS_UD_CS_CORE`, `SECURITY`, `NET` and `CLUSTER`. All of them begin with the
+same 4-byte `TS_UD_HEADER` - type and length, with no flags field - and the
+declared length is the size of the whole block including that header. The
+length is patched in once the variable-length fields are written, because a
+reader walks it to find the next block and a declared length that disagrees
+with the real one desynchronises everything after it rather than failing.
+
+`CORE` is 234 octets and carries three fixed-width NUL-padded fields
+(`clientName`, `imeFileName`, `clientDigProductId`).
+
+There is no `TS_UD_CS_USER` in MS-RDPBCGR. `BuildUser` produces the
+classic-RDP structure of that name, which predates the specification, sends a
+password in the clear, and is ignored by xrdp; it is opt-in through
+`RdpConnectionOptions.SendClassicUserBlock`.
 
 ### `RdpConnection.cs`
 
@@ -84,6 +95,19 @@ reproducible.
 CredSSP, `ConnectAsync` returns `Failed` with an explanation. Sending an MCS
 Connect Initial anyway would be a protocol violation, and the resulting reset
 would look like a bug rather than a missing feature.
+
+**A stage is not complete until the reply has been read.** Each step waits for
+the server's Confirm and parses it, and a refusal is reported with the
+server's own reason. The alternative is worse than useless: an earlier version
+sent the Erect Domain, Attach User and Channel Join requests, read none of the
+replies, and reported a completed channel join against a server that had
+rejected the first PDU. A client that cannot tell a refused connection from an
+accepted one cannot be diagnosed at all.
+
+The Attach User Confirm is not optional bookkeeping, either. It is the only
+place the server states which user id it assigned, and the Channel Join
+Request has to carry that id - a conventional 1001 is rejected by a server
+that did not attach that user.
 
 **Credentials never touch the log.** `rdpprobe` reads the password from
 `RDP_PASSWORD` and never echoes it. `.gitignore` excludes `*.rdp` and `.env`.

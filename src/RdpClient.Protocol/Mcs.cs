@@ -415,7 +415,7 @@ public static class Mcs
     /// server rejects a join request whose initiator is not the user it
     /// attached.
     /// </param>
-    /// <param name="channelId">The channel to join, conventionally 1007.</param>
+    /// <param name="channelId">The channel to join, conventionally 1003.</param>
     public static byte[] BuildChannelJoinRequest(ushort userId, ushort channelId)
     {
         if (userId < Rdp.McsUserChannelBase)

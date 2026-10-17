@@ -192,9 +192,11 @@ public sealed partial class MainPageViewModel : ObservableObject, IAsyncDisposab
                     UserName = UserName,
                     Domain = Domain,
 
-                    // TS_UD_CS_USER needs the UTF-16 byte length up front, so the
-                    // secret has to exist as a string. A shipping client would
-                    // authenticate through CredSSP instead and never hold it.
+                    // The classic-RDP user block needs the UTF-16 byte length
+                    // up front, so the secret has to exist as a string. A
+                    // shipping client would authenticate through CredSSP
+                    // instead and never hold it, and this block is opt-in
+                    // precisely because it puts the password on the wire.
                     Password = Password,
                 };
 
