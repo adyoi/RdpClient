@@ -25,6 +25,23 @@ actually confirmed.
 - **Parsing for the server's replies.** `AttachUserConfirm` and
   `ChannelJoinConfirm` are read and interpreted, and the client stops with the
   server's reason when either refuses.
+- **The mandatory capability exchange is implemented** (MS-RDPBCGR 2.2.1.13).
+  `Capability.cs` builds and parses the Share Control Header, the General
+  Capability Set, the server's Demand Active PDU and the client's Confirm Active
+  PDU, and `Mcs.ParseSendDataIndication` reads the MCS fragments a server PDU
+  arrives in. `HandshakeStage` gains `CapabilityExchanged` and `ActiveConfirmed`.
+  Unit-tested, but **not verified against a live server** - see the note at the
+  end of this release.
+- **The handshake is bounded.** `RdpConnectionOptions.Timeout`, 30 seconds by
+  default, `rdpprobe --timeout <seconds>`. Every read in the sequence is a
+  blocking socket read, so a server that stopped mid-sequence left the client
+  waiting forever: it had to be killed rather than returning, and the server log
+  was completely clean, so there was nothing to diagnose. A timeout turns the
+  same situation into `the server stopped responding after 12s; the last thing
+  that worked was the channel joins; it never sent the Demand Active PDU`.
+- **`--skip-channel-join`** announces `RNS_UD_CS_SUPPORT_SKIP_CHANNELJOIN` and
+  sends no Channel Join Requests. Off by default, and not verified to help; see
+  the note at the end of this release.
 
 ### Fixed
 
@@ -177,6 +194,31 @@ actually confirmed.
   or above 0x80 and +13 below - which agrees with that formula at every input,
   including the narrow band where the total crosses 0x80 while the client data does
   not.
+
+### Known gaps
+
+- **The Demand Active PDU never arrives from this xrdp, so the capability
+  exchange is unverified end to end.** The MCS sequence completes - xrdp accepts
+  all ten channel joins, answers every Confirm, and logs
+  `xrdp_load_keyboard_layout`, which it only does once MCS completes - and then
+  xrdp sends nothing and waits. From its source that is not specific to one
+  strategy: `handle_channel_join_requests` does a `libxrdp_force_read` after
+  every join, and `libxrdp_process_data` does another before it will send the
+  Demand Active, so a client sending ten joins blocks xrdp on the first and a
+  client sending none blocks it on the second. Both were tried; both are silent.
+  What a client is supposed to send at that point, if anything, is still unknown.
+  A `tools/rdp-tap.mjs` capture of `mstsc` was the obvious next measurement and
+  did not settle it, because the MCS PDUs arrive inside TLS 1.3 and cannot be
+  read without the session keys.
+- **`TS_UD_CS_CORE` is 234 octets on the strength of the specification and
+  FreeRDP, not a capture.** `mstscax.dll` builds the client data blocks through a
+  COM vtable one hop beyond its only caller. It is pinned by a test now, which
+  pins the arithmetic and not a measurement.
+- **The static channel list is a guess.** `rdpdr`, `cliprdr` and `drdynvc` exist
+  in `mstscax.dll` as UTF-16 strings; `rdpgfx`, `urbout`, `encomsp` and `audin`
+  are absent from that binary entirely.
+- **NTLM end to end is still unverified**, and needs a Windows host or a server
+  that offers CredSSP.
 
 ### Security
 

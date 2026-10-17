@@ -641,6 +641,76 @@ public static class Mcs
     }
 
     /// <summary>
+    /// One MCS Send Data Indication: a fragment of application data the server
+    /// sent on a channel.
+    /// </summary>
+    /// <remarks>
+    /// This is how every server-to-client PDU after the channel joins arrives.
+    /// It carries a fragmentation field, so a Demand Active PDU larger than one
+    /// fragment arrives as several of these and has to be reassembled before it
+    /// can be parsed.
+    /// </remarks>
+    public sealed record SendDataIndication(
+        ushort ChannelId, byte Segmentation, int FragmentLength, byte[] Payload);
+
+    /// <summary>Segmentation value marking the final fragment of a multi-fragment PDU.</summary>
+    public const byte SegmentationLast = 0x03;
+
+    /// <summary>Segmentation value for a PDU that fits in one fragment.</summary>
+    public const byte SegmentationSingle = 0x00;
+
+    /// <summary>
+    /// Upper bound on the fragments reassembled into one PDU.
+    /// </summary>
+    /// <remarks>
+    /// A slow-path PDU is capped well below the MCS maximum, so anything past
+    /// this is a PDU that is not being reassembled correctly. Without a bound a
+    /// wrong segmentation value is indistinguishable from a slow server, and the
+    /// read simply never finishes.
+    /// </remarks>
+    public const int MaxSendDataFragments = 256;
+
+    /// <summary>
+    /// Parse an MCS Send Data Indication (MS-RDPBCGR 2.2.1.10.1, T.125 8.4.2).
+    /// </summary>
+    public static SendDataIndication ParseSendDataIndication(byte[] buffer)
+    {
+        var pdu = ParseDomainPdu(buffer);
+        if (pdu.Choice != Rdp.McsChoiceSendDataIndication)
+        {
+            throw new InvalidDataException(
+                $"expected a Send Data Indication (choice {Rdp.McsChoiceSendDataIndication}), "
+                + $"got choice {pdu.Choice}");
+        }
+
+        var r = new ByteReader(pdu.Payload);
+        r.Skip(2);                                   // initiator
+        ushort channel = r.U16BigEndian();
+        byte dataPriority = r.U8();
+
+        // priority(1 bit) | segmentation(2 bits) | then reserved. Only the
+        // segmentation field decides whether more fragments follow.
+        byte segmentation = (byte)((dataPriority >> 5) & 0x03);
+
+        int fragmentLength = r.U16();
+        if (fragmentLength < 2)
+        {
+            throw new InvalidDataException(
+                $"a Send Data Indication fragment length must cover its own field, got {fragmentLength}");
+        }
+
+        int dataLength = fragmentLength - 2;
+        if (r.Remaining < dataLength)
+        {
+            throw new InvalidDataException(
+                $"the Send Data Indication declares a {dataLength}-octet fragment but only "
+                + $"{r.Remaining} octets remain");
+        }
+
+        return new SendDataIndication(channel, segmentation, dataLength, r.Bytes(dataLength));
+    }
+
+    /// <summary>
     /// Wrap a server data PDU in an MCS Send Data Request, chunked.
     /// </summary>
     /// <remarks>

@@ -776,6 +776,165 @@ public class McsTests
         Assert.Equal(8 + 31 * 12, ClientPdu.BuildNet(tooMany.Take(31).ToArray()).Length);
     }
 
+    /// <summary>
+    /// The skip-channel-join flag lives in CORE's earlyCapabilityFlags, and it
+    /// is the thing that tells the server the client owes it no joins.
+    /// </summary>
+    [Fact]
+    public void Core_CarriesTheSkipChannelJoinFlagInEarlyCapabilityFlags()
+    {
+        Assert.Equal(0x0800, Rdp.EarlyCapSupportSkipChannelJoin);
+
+        byte[] core = ClientPdu.BuildCore(new ClientPdu.CoreOptions
+        {
+            EarlyCapabilityFlags = Rdp.EarlyCapSupportSkipChannelJoin,
+        });
+
+        // The block is the 234 octets MS-RDPBCGR 2.2.1.3.2 lays out, header
+        // included, and earlyCapabilityFlags sits between supportedColorDepths
+        // and the 64-octet clientDigProductId.
+        Assert.Equal(234, core.Length);
+        Assert.Equal(234, core[2] | (core[3] << 8));
+        Assert.Equal(Rdp.EarlyCapSupportSkipChannelJoin, core[144] | (core[145] << 8));
+    }
+
+    /// <summary>
+    /// The Share Control Header packs the PDU type into the top two bits.
+    /// </summary>
+    [Theory]
+    [InlineData(1, 0x1001)]   // Demand Active
+    [InlineData(3, 0x3001)]   // Confirm Active
+    public void ShareControlHeader_PacksTheTypeIntoItsTopBits(int pduType, int expectedPduType2)
+    {
+        byte[] header = Capability.BuildShareControlHeader(pduType, 0, totalLength: 0x2e);
+
+        Assert.Equal(6, header.Length);
+        Assert.Equal(0x2e, header[0] | (header[1] << 8));              // totalLength
+        Assert.Equal(expectedPduType2, header[2] | (header[3] << 8));  // pduType2
+        Assert.Equal(0, header[4] | (header[5] << 8));                // pduType1, reserved
+
+        var parsed = Capability.ParseShareControlHeader(header);
+        Assert.Equal(pduType, parsed.PduType);
+        Assert.Equal(1, parsed.PduVersion);
+        Assert.Equal(6, parsed.PayloadOffset);
+    }
+
+    /// <summary>
+    /// The General Capability Set is a fixed 24 octets, and 18 of them are
+    /// fields the specification requires to be zero for this client.
+    /// </summary>
+    [Fact]
+    public void GeneralCapabilitySet_MatchesTheSpecificationLayout()
+    {
+        byte[] set = Capability.BuildGeneralCapabilitySet();
+
+        Assert.Equal(24, set.Length);
+        Assert.Equal("010018000100030000020000000000000000000000000000", Convert.ToHexString(set).ToLowerInvariant());
+    }
+
+    /// <summary>
+    /// A Demand Active PDU walks to its capability sets and its session id.
+    /// </summary>
+    [Fact]
+    public void ParseDemandActive_ReadsTheCapabilitySetsAndTheSessionId()
+    {
+        // Share Control Header(6) shareID(4) lengthSourceDescriptor(2)
+        // lengthCombinedCapabilities(2) numberCapabilities(2) pad2Octets(2)
+        // General set(24) sessionId(4) = 46 octets.
+        byte[] pdu = Convert.FromHexString(
+            "2e00" +     // totalLength 46
+            "0110" +     // pduType2: Demand Active, protocol version 1
+            "0000" +     // pduType1
+            "34120000" + // shareID 0x1234
+            "0000" +     // lengthSourceDescriptor 0
+            "1c00" +     // lengthCombinedCapabilities 28 = 4 + 24
+            "0100" +     // numberCapabilities 1
+            "0000" +     // pad2Octets
+            "010018000100030000020000000000000000000000000000" +
+            "01000000"); // sessionId 1
+
+        var demand = Capability.ParseDemandActive(pdu);
+
+        Assert.Equal(0x1234, demand.ShareId);
+        Assert.Equal(1u, demand.SessionId);
+        var only = Assert.Single(demand.Capabilities);
+        Assert.Equal((ushort)1, only.Type);
+        Assert.Equal(24, only.Length);
+        Assert.Contains("General", demand.Summary, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A capability count that disagrees with the sets actually present is a
+    /// malformed PDU, not something to carry on from.
+    /// </summary>
+    [Fact]
+    public void ParseDemandActive_RejectsACountThatDoesNotMatchTheSets()
+    {
+        byte[] pdu = Convert.FromHexString(
+            "2e00" + "0110" + "0000" + "34120000" + "0000" + "1c00" +
+            "0200" +     // claims two capability sets
+            "0000" +
+            "010018000100030000020000000000000000000000000000" +
+            "01000000");
+
+        var ex = Assert.Throws<InvalidDataException>(() => Capability.ParseDemandActive(pdu));
+        Assert.Contains("declares 2 capability sets but 1", ex.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The Confirm Active PDU is a Confirm Active header, the server channel as
+    /// originator, and nothing but the capabilities.
+    /// </summary>
+    [Fact]
+    public void BuildConfirmActivePdu_CarriesTheServerChannelAsItsOriginator()
+    {
+        byte[] pdu = Capability.BuildConfirmActivePdu(shareId: 0x1234, [Capability.BuildGeneralCapabilitySet()]);
+
+        Assert.Equal(6 + 4 + 2 + 2 + 2 + 4 + 24, pdu.Length);
+
+        var header = Capability.ParseShareControlHeader(pdu);
+        Assert.Equal(Capability.PduTypeConfirmActive, header.PduType);
+        Assert.Equal(pdu.Length, header.TotalLength);
+
+        Assert.Equal(0x1234, pdu[6] | (pdu[7] << 8) | (pdu[8] << 16) | (pdu[9] << 24)); // shareID
+        Assert.Equal(1002, pdu[10] | (pdu[11] << 8));                                   // originatorID
+        Assert.Equal(0, pdu[12] | (pdu[13] << 8));                                     // lengthSourceDescriptor
+        Assert.Equal(28, pdu[14] | (pdu[15] << 8));                                    // lengthCombinedCapabilities
+        Assert.Equal(1, pdu[16] | (pdu[17] << 8));                                     // numberCapabilities
+    }
+
+    /// <summary>
+    /// A Send Data Indication is how every server PDU after the joins arrives.
+    /// </summary>
+    [Fact]
+    public void SendDataIndication_ReadsTheChannelAndTheFragmentation()
+    {
+        // 03 00 00 17 | 02 f0 80 | 68 | 0001 | 03eb | 70 | 0a00 | 8 octets
+        byte[] indication = Convert.FromHexString("0300001702f08068000103eb700a000011223344556677");
+
+        var parsed = Mcs.ParseSendDataIndication(indication);
+
+        Assert.Equal((ushort)1003, parsed.ChannelId);
+        Assert.Equal(Mcs.SegmentationLast, parsed.Segmentation);
+        Assert.Equal(8, parsed.Payload.Length);
+        Assert.Equal("0011223344556677", Convert.ToHexString(parsed.Payload).ToLowerInvariant());
+    }
+
+    /// <summary>
+    /// A Send Data Indication that claims more data than it carries is malformed.
+    /// </summary>
+    [Fact]
+    public void SendDataIndication_RejectsAFragmentLengthBeyondThePDU()
+    {
+        // Declares a 10-octet fragment, so 8 octets of data, but carries 2. The TPKT
+        // length is consistent on purpose, so the failure comes from the fragment
+        // length rather than from the envelope.
+        byte[] indication = Convert.FromHexString("0300001102f08068000103eb700a000011");
+
+        var ex = Assert.Throws<InvalidDataException>(() => Mcs.ParseSendDataIndication(indication));
+        Assert.Contains("declares a 8-octet fragment but only 2", ex.Message, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void SendDataRequest_ChunksLargePayloadsInsideTheMcsEnvelope()
     {

@@ -103,6 +103,7 @@ public static class Rdp
     public const int McsChoiceChannelJoinConfirm = 15;
     public const int McsChoiceDisconnectProviderUltimatum = 8;
     public const int McsChoiceSendDataRequest = 25;
+    public const int McsChoiceSendDataIndication = 26;
 
     /// <summary>Turn a DomainMCSPDU choice into the octet that carries it.</summary>
     /// <param name="choice">One of the <c>McsChoice*</c> values.</param>
@@ -119,6 +120,16 @@ public static class Rdp
     /// that joins 1007 is joining a channel no server created.
     /// </remarks>
     public const ushort McsGlobalChannel = 1003;
+
+    /// <summary>
+    /// The MCS server channel, 1002 (MS-RDPBCGR 2.2.1.13.2.1).
+    /// </summary>
+    /// <remarks>
+    /// Not joined by the client: it belongs to the server. It appears here only
+    /// as the fixed originator ID the Confirm Active PDU must carry, which is a
+    /// different field from the channel the PDU travels on.
+    /// </remarks>
+    public const ushort McsServerChannel = 1002;
 
     /// <summary>The MCS user channel, 1001 (MS-RDPBCGR 2.2.1.8).</summary>
     /// <remarks>
@@ -180,6 +191,40 @@ public static class Rdp
     public const ushort TsUdCsUser = 0xc00e;
 
     public const uint RdpVersion5Plus = 0x80000005;
+
+    // earlyCapabilityFlags in TS_UD_CS_CORE (MS-RDPBCGR 2.2.1.3.2).
+    public const ushort EarlyCapSupportErrInfoPdu = 0x0001;
+    public const ushort EarlyCapWant32BppSession = 0x0002;
+    public const ushort EarlyCapSupportStatusInfoPdu = 0x0004;
+    public const ushort EarlyCapStrongAsymmetricKeys = 0x0008;
+    public const ushort EarlyCapRelativeMouseInput = 0x0010;
+    public const ushort EarlyCapValidConnectionType = 0x0020;
+    public const ushort EarlyCapSupportMonitorLayoutPdu = 0x0040;
+    public const ushort EarlyCapSupportNetcharAutodetect = 0x0080;
+    public const ushort EarlyCapSupportDynvcGfxProtocol = 0x0100;
+    public const ushort EarlyCapSupportDynamicTimeZone = 0x0200;
+    public const ushort EarlyCapSupportHeartbeatPdu = 0x0400;
+
+    /// <summary>
+    /// RNS_UD_CS_SUPPORT_SKIP_CHANNELJOIN, which changes what the client owes
+    /// the server (MS-RDPBCGR 2.2.1.3.2).
+    /// </summary>
+    /// <remarks>
+    /// With this flag set the client sends <em>no</em> Channel Join Requests. It
+    /// is not an optimisation on top of joining; it replaces it, and a client
+    /// that sets it and then joins anyway has told the server two contradictory
+    /// things.
+    /// <para>
+    /// Setting it is also the only way to get past xrdp. Its
+    /// <c>handle_channel_join_requests</c> leaves
+    /// <c>expected_join_count</c> at zero when the flag is present, so the loop
+    /// that consumes joins - and which does a <c>libxrdp_force_read</c> after
+    /// each one, waiting for whatever comes next - never runs. A client that
+    /// does join leaves xrdp blocked on that read while the client waits for the
+    /// Demand Active PDU, and neither side ever speaks again.
+    /// </para>
+    /// </remarks>
+    public const ushort EarlyCapSupportSkipChannelJoin = 0x0800;
 
     // --- Capability sets (MS-RDPBCGR 2.2.7) --------------------------------
 

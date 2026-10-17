@@ -64,7 +64,14 @@ internal static class Program
             User = user,
             UseCorrelationId = !options.ContainsKey("no-correlation"),
             LogTx = options.ContainsKey("hex"),
+            SkipChannelJoin = options.ContainsKey("skip-channel-join"),
         };
+
+        if (options.TryGetValue("timeout", out string? seconds)
+            && int.TryParse(seconds, out int timeout))
+        {
+            connectionOptions = connectionOptions with { Timeout = timeout };
+        }
 
         if (options.ContainsKey("tls12"))
         {
@@ -172,6 +179,11 @@ internal static class Program
               --user     user name; when set, TS_UD_CS_USER is sent
               --domain   domain for the user name
               --hex      dump transmitted PDUs as hex
+              --timeout <seconds>
+                         give up on the handshake after this long (default 30)
+              --skip-channel-join
+                         announce RNS_UD_CS_SUPPORT_SKIP_CHANNELJOIN and
+                         send no Channel Join Requests. Unverified against xrdp.
               --tls12     restrict TLS to 1.2 instead of 1.2/1.3
               --tls-only  require PROTOCOL_SSL (TLS only, no SPNEGO)
               --credssp-only

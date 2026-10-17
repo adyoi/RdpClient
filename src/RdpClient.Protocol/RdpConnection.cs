@@ -20,6 +20,8 @@ public enum HandshakeStage
     DomainErected,
     UserAttached,
     ChannelJoined,
+    CapabilityExchanged,
+    ActiveConfirmed,
     Complete,
     Failed,
 }
@@ -55,6 +57,37 @@ public sealed record RdpConnectionOptions
 
     /// <summary>Log each transmitted PDU as hex. Credential-bearing PDUs are never logged.</summary>
     public bool LogTx { get; init; }
+
+    /// <summary>
+    /// Turning this on announces <c>RNS_UD_CS_SUPPORT_SKIP_CHANNELJOIN</c> and sends
+    /// no Channel Join Requests at all. Off by default.
+    /// </summary>
+    /// <remarks>
+    /// The flag and the behaviour are set together from this one property,
+    /// because they contradict each other: announcing the skip and then joining
+    /// anyway tells the server two contradictory things.
+    /// <para>
+    /// It is off by default because it is the unverified path. Sending the joins
+    /// is the measured one: xrdp accepts the full set, answers every Confirm and
+    /// completes its MCS sequence. Whether it then sends the Demand Active PDU is
+    /// a separate question this option does not by itself settle, which is what
+    /// <see cref="Timeout"/> is for.
+    /// </para>
+    /// </remarks>
+    public bool SkipChannelJoin { get; init; }
+
+    /// <summary>
+    /// How long the whole handshake may take, in seconds. 30 by default.
+    /// </summary>
+    /// <remarks>
+    /// Every read here is a blocking socket read, so a server that stops
+    /// mid-sequence leaves the client waiting forever with nothing in the log:
+    /// the failure is indistinguishable from a slow server. That was measured
+    /// rather than assumed - the probe had to be killed instead of returning. A
+    /// bounded handshake turns it into a reported failure with a cause, which is
+    /// the only useful outcome; the alternative is a process that looks hung.
+    /// </remarks>
+    public int Timeout { get; init; } = 30;
 
     /// <summary>
     /// External security protocol to require. <see cref="SecurityModeSelection.Negotiate"/>
@@ -127,12 +160,25 @@ public sealed class RdpConnection : IAsyncDisposable
     /// <summary>Run the connection sequence described by <paramref name="options"/>.</summary>
     public async Task<HandshakeStage> ConnectAsync(
         RdpConnectionOptions options,
-        CancellationToken cancellationToken = default)
+        CancellationToken callerToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(options.Host);
 
         string host = options.Host;
         int port = options.Port;
+
+        // A blocking socket read cannot tell a stalled server from a slow one, so
+        // the whole handshake is bounded. Without this the client waits forever
+        // and looks hung, which is exactly what a truncated capture shows: the
+        // server logs nothing and the client never returns.
+        using var deadline = new CancellationTokenSource(
+            TimeSpan.FromSeconds(options.Timeout > 0 ? options.Timeout : 30));
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+            deadline.Token, callerToken);
+
+        // Named for the rest of the method so that every await below is bounded
+        // without each one having to know where the deadline came from.
+        CancellationToken cancellationToken = linked.Token;
 
         // Advertise only the protocols the caller is willing to complete. The default
         // offers what mstsc offers, so an unmodified host picks what it prefers.
@@ -319,16 +365,47 @@ public sealed class RdpConnection : IAsyncDisposable
             Report(HandshakeStage.UserAttached, attachConfirm.Summary);
 
             // Every channel offered in TS_UD_CS_NET is joined by its own Channel
-            // Join Request, then the MCS user channel and the global channel.
-            // xrdp counts the joins it expects as channel_list->count + 2, so a
-            // client that joins only the global channel leaves the server reading
-            // a join that will never arrive - which is what its log reports as a
-            // channel join failure after a clean single join.
-            await JoinChannelsAsync(assigned, channelCount, cancellationToken).ConfigureAwait(false);
+            // Join Request, then the MCS user channel and the global channel -
+            // unless the client announced RNS_UD_CS_SUPPORT_SKIP_CHANNELJOIN, in
+            // which case it owes the server no joins at all. Both paths are here
+            // because the flag is what selects between them.
+            if (options.SkipChannelJoin)
+            {
+                Report(HandshakeStage.ChannelJoined,
+                    $"announced RNS_UD_CS_SUPPORT_SKIP_CHANNELJOIN "
+                    + $"({Rdp.EarlyCapSupportSkipChannelJoin:x4}); sent no Channel Join Requests");
+            }
+            else
+            {
+                await JoinChannelsAsync(assigned, channelCount, cancellationToken).ConfigureAwait(false);
+            }
+
+            // --- 2.2.1.13 Mandatory capability exchange ---
+            //
+            // The server now asks for capabilities with a Demand Active PDU and
+            // will not send anything further until a Confirm Active comes back.
+            // Reading it is also the first proof that the channel joins landed:
+            // the server only gets here once its expected joins have arrived.
+            Capability.DemandActive demand = await ReadDemandActiveAsync(cancellationToken)
+                .ConfigureAwait(false);
+            Report(HandshakeStage.CapabilityExchanged,
+                $"server demanded {demand.Capabilities.Count} capability sets "
+                + $"({demand.Summary}), session {demand.SessionId}");
+
+            byte[] confirmActive = Capability.BuildConfirmActivePdu(
+                demand.ShareId, [Capability.BuildGeneralCapabilitySet()]);
+            await SendOnGlobalChannelAsync(assigned, confirmActive, cancellationToken).ConfigureAwait(false);
+            Report(HandshakeStage.ActiveConfirmed,
+                $"answered with {Capability.DescribeCapabilitySets(
+                    Capability.ParseCapabilitySets(
+                        confirmActive,
+                        Capability.ShareControlHeaderSize + 4 + 2 + 2 + 2 + 4,
+                        confirmActive.Length - Capability.ShareControlHeaderSize - 4 - 2 - 2 - 2 - 4))} "
+                + $"in {confirmActive.Length} bytes");
 
             Report(HandshakeStage.Complete,
-                "MCS channel joined. The capability exchange, graphics and input are "
-                + "not implemented yet, so the session will not display a desktop.");
+                "Capability exchange complete. Licensing, the Synchronize PDUs, graphics "
+                + "and input are not implemented yet, so the session will not display a desktop.");
             return HandshakeStage.Complete;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -336,6 +413,17 @@ public sealed class RdpConnection : IAsyncDisposable
             // TLS and SPNEGO failures are usually wrapped; the inner message is
             // the one that says what actually went wrong.
             FailureReason = Describe(ex);
+            Report(HandshakeStage.Failed, FailureReason, isError: true);
+            return HandshakeStage.Failed;
+        }
+        catch (OperationCanceledException) when (deadline.IsCancellationRequested)
+        {
+            // The stage is still whatever was last reported, which is the useful
+            // part: "it stopped while waiting for the Demand Active PDU" is a
+            // diagnosable failure, and waiting forever is not a failure at all.
+            FailureReason =
+                $"the server stopped responding after {options.Timeout}s; the last thing that "
+                + $"worked was {DescribeStage(Stage)}";
             Report(HandshakeStage.Failed, FailureReason, isError: true);
             return HandshakeStage.Failed;
         }
@@ -364,6 +452,12 @@ public sealed class RdpConnection : IAsyncDisposable
         core = (core ?? new ClientPdu.CoreOptions()) with
         {
             ServerSelectedProtocol = serverSelectedProtocol,
+
+            // Announcing the skip and then joining anyway tells the server two
+            // contradictory things, so the flag and the channel joins are decided
+            // in the same place.
+            EarlyCapabilityFlags = (ushort)((core?.EarlyCapabilityFlags ?? 0)
+                | (options.SkipChannelJoin ? Rdp.EarlyCapSupportSkipChannelJoin : 0)),
         };
 
         var blocks = new List<byte[]>
@@ -452,6 +546,69 @@ public sealed class RdpConnection : IAsyncDisposable
     }
 
     /// <summary>
+    /// Read the server's Demand Active PDU, reassembling it if it arrives in
+    /// several MCS fragments.
+    /// </summary>
+    /// <remarks>
+    /// A PDU larger than one MCS fragment arrives as a run of Send Data
+    /// Indications and only the one marked as the last fragment completes it.
+    /// Reading a single one of those is the same mistake as reading a single
+    /// reply: the PDU would be parsed from a prefix and every field after the cut
+    /// would come from the wrong place.
+    /// </remarks>
+    private async Task<Capability.DemandActive> ReadDemandActiveAsync(CancellationToken cancellationToken)
+    {
+        var buffer = new MemoryStream();
+        int fragments = 0;
+
+        while (true)
+        {
+            var indication = Mcs.ParseSendDataIndication(
+                await ReadTpktAsync(cancellationToken).ConfigureAwait(false));
+
+            if (indication.ChannelId != Rdp.McsGlobalChannel)
+            {
+                throw new RdpProtocolException(
+                    $"expected the Demand Active PDU on MCS channel {Rdp.McsGlobalChannel}, "
+                    + $"the server used {indication.ChannelId}");
+            }
+
+            buffer.Write(indication.Payload, 0, indication.Payload.Length);
+
+            if (indication.Segmentation is Mcs.SegmentationLast or Mcs.SegmentationSingle)
+            {
+                break;
+            }
+
+            // A misread segmentation value would otherwise loop on this read
+            // until the socket closed, which is how a parse bug turns into a
+            // hang with no diagnostic at all.
+            if (++fragments > Mcs.MaxSendDataFragments)
+            {
+                throw new RdpProtocolException(
+                    $"the Demand Active PDU is still incomplete after {fragments} fragments "
+                    + $"({buffer.Length} octets); the segmentation field is probably being read wrong");
+            }
+        }
+
+        return Capability.ParseDemandActive(buffer.ToArray());
+    }
+
+    /// <summary>Send one PDU on the MCS global channel as an MCS Send Data Request.</summary>
+    private async Task SendOnGlobalChannelAsync(
+        ushort userId, byte[] payload, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(_channel);
+
+        foreach (byte[] frame in Mcs.BuildSendDataRequest(userId, Rdp.McsGlobalChannel, payload))
+        {
+            await _channel.WriteAsync(frame, cancellationToken).ConfigureAwait(false);
+        }
+
+        await _channel.FlushAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// Repeat the RDP negotiation inside the CredSSP channel.
     /// </summary>
     /// <remarks>
@@ -505,6 +662,24 @@ public sealed class RdpConnection : IAsyncDisposable
 
         return string.Join(" -> ", parts);
     }
+
+    /// <summary>Name the stage a timeout interrupted, for a failure with no other cause.</summary>
+    private static string DescribeStage(HandshakeStage stage) => stage switch
+    {
+        HandshakeStage.Idle => "the TCP connection",
+        HandshakeStage.TcpConnected => "the X.224 connection request",
+        HandshakeStage.Negotiated => "the security protocol negotiation",
+        HandshakeStage.TlsEstablished => "the TLS handshake",
+        HandshakeStage.Authenticated => "NTLM authentication",
+        HandshakeStage.Renegotiated => "the negotiation inside the CredSSP channel",
+        HandshakeStage.McsAccepted => "the MCS Connect Initial",
+        HandshakeStage.DomainErected => "the Erect Domain Request",
+        HandshakeStage.UserAttached => "the Attach User Confirm",
+        HandshakeStage.ChannelJoined => "the channel joins; it never sent the Demand Active PDU",
+        HandshakeStage.CapabilityExchanged => "the capability sets it demanded",
+        HandshakeStage.ActiveConfirmed => "the Confirm Active PDU",
+        _ => stage.ToString(),
+    };
 
     /// <summary>Format bytes as offset-prefixed hex, for protocol debugging.</summary>
     private static string Hex(byte[] data)
