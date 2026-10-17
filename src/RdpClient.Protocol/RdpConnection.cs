@@ -42,6 +42,17 @@ public sealed record RdpConnectionOptions
     /// </summary>
     public bool UseCorrelationId { get; init; } = true;
 
+    /// <summary>
+    /// Append the classic-RDP user data block that carries a password.
+    /// </summary>
+    /// <remarks>
+    /// Off by default. MS-RDPBCGR 2.2.1.3 defines no such block - xrdp answers
+    /// <c>TS_UD_HEADER type 0xc00e is unknown (ignored)</c> - so enabling this
+    /// sends a credential in UTF-16 in the clear to a server that discards it.
+    /// It exists to exercise the classic path deliberately, not by default.
+    /// </remarks>
+    public bool SendClassicUserBlock { get; init; }
+
     /// <summary>Log each transmitted PDU as hex. Credential-bearing PDUs are never logged.</summary>
     public bool LogTx { get; init; }
 
@@ -250,7 +261,7 @@ public sealed class RdpConnection : IAsyncDisposable
             }
 
             // --- 2.2.1.3.4 MCS Connect Initial ---
-            byte[] clientInfo = BuildClientInfo(options.User, options.Core, confirm.SelectedProtocol ?? 0);
+            byte[] clientInfo = BuildClientInfo(options.User, options.Core, selected, options);
             byte[] connectInitial = Mcs.BuildConnectInitialPdu(new Mcs.ConnectInitialOptions
             {
                 ClientInfo = clientInfo,
@@ -272,20 +283,44 @@ public sealed class RdpConnection : IAsyncDisposable
             Report(HandshakeStage.McsAccepted, connectResponse.Summary);
 
             // --- 2.2.1.3.6 Erect Domain, 2.2.1.3.7 Attach User, 2.2.1.3.8 join ---
-            byte[] erect = Mcs.BuildErectDomainRequest(0x03fa, Rdp.McsGlobalChannel);
+            //
+            // Each of these is answered by the server, and each answer is what
+            // proves the step worked. Sending them and declaring success without
+            // reading the replies is how a connection that the server rejected
+            // at the first PDU gets reported as a completed channel join.
+            byte[] erect = Mcs.BuildErectDomainRequest();
             await _channel.WriteAsync(erect, cancellationToken);
             await _channel.FlushAsync(cancellationToken);
             Report(HandshakeStage.DomainErected, $"sent Erect Domain Request ({erect.Length} bytes)");
 
-            byte[] attach = Mcs.BuildAttachUserRequest(0x03fa, Rdp.McsUserChannelBase);
+            byte[] attach = Mcs.BuildAttachUserRequest();
             await _channel.WriteAsync(attach, cancellationToken);
             await _channel.FlushAsync(cancellationToken);
-            Report(HandshakeStage.UserAttached, $"sent Attach User Request, UserID {Rdp.McsUserChannelBase}");
+            Report(HandshakeStage.UserAttached, $"sent Attach User Request ({attach.Length} bytes)");
 
-            byte[] join = Mcs.BuildChannelJoinRequest(0x03fa, Rdp.McsGlobalChannel, Rdp.McsUserChannelBase);
+            // The Attach User Confirm is where the server states which user id
+            // it assigned. The Channel Join Request must carry that id, not a
+            // conventional 1001, so it cannot be built until this has been read.
+            var attachConfirm = Mcs.ParseAttachUserConfirm(await ReadTpktAsync(cancellationToken));
+            if (!attachConfirm.Success || attachConfirm.UserId is not ushort assigned)
+            {
+                throw new RdpProtocolException($"the server did not attach the user: {attachConfirm.Summary}");
+            }
+
+            UserId = assigned;
+            Report(HandshakeStage.UserAttached, attachConfirm.Summary);
+
+            byte[] join = Mcs.BuildChannelJoinRequest(assigned, Rdp.McsGlobalChannel);
             await _channel.WriteAsync(join, cancellationToken);
             await _channel.FlushAsync(cancellationToken);
-            Report(HandshakeStage.ChannelJoined, $"joined MCS global channel {Rdp.McsGlobalChannel}");
+
+            var joinConfirm = Mcs.ParseChannelJoinConfirm(await ReadTpktAsync(cancellationToken));
+            if (!joinConfirm.Success)
+            {
+                throw new RdpProtocolException($"the server refused the channel join: {joinConfirm.Summary}");
+            }
+
+            Report(HandshakeStage.ChannelJoined, joinConfirm.Summary);
 
             Report(HandshakeStage.Complete,
                 "MCS channel joined. The capability exchange, graphics and input are "
@@ -310,12 +345,22 @@ public sealed class RdpConnection : IAsyncDisposable
     }
 
     /// <summary>Concatenate the TS_UD_CS_* blocks a server expects before MCS completes.</summary>
+    /// <remarks>
+    /// The negotiated protocol is written into CORE's serverSelectedProtocol
+    /// whatever the caller supplied, because MS-RDPBCGR 2.2.1.3.2 says the field
+    /// carries the value the server returned in its RDP_NEG_RSP and the server
+    /// compares it against what it actually selected.
+    /// </remarks>
     private static byte[] BuildClientInfo(
         ClientPdu.UserOptions? user,
         ClientPdu.CoreOptions? core,
-        uint serverSelectedProtocol)
+        uint serverSelectedProtocol,
+        RdpConnectionOptions options)
     {
-        core ??= new ClientPdu.CoreOptions { ServerSelectedProtocol = serverSelectedProtocol };
+        core = (core ?? new ClientPdu.CoreOptions()) with
+        {
+            ServerSelectedProtocol = serverSelectedProtocol,
+        };
 
         var blocks = new List<byte[]>
         {
@@ -325,8 +370,12 @@ public sealed class RdpConnection : IAsyncDisposable
             ClientPdu.BuildCluster(),
         };
 
-        // TS_UD_CS_USER is only sent when there are credentials to present.
-        if (user is not null && !string.IsNullOrEmpty(user.UserName))
+        // The user block is not part of MS-RDPBCGR and xrdp answers
+        // "TS_UD_HEADER type 0xc00e is unknown (ignored)". Sending it sends a
+        // password the server is about to discard, so it is opt-in rather than
+        // automatic: a caller that wants the classic cleartext path has to say
+        // so, which is the point at which the README's security warning applies.
+        if (user is not null && !string.IsNullOrEmpty(user.UserName) && options.SendClassicUserBlock)
         {
             blocks.Add(ClientPdu.BuildUser(user));
         }
