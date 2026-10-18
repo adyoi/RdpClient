@@ -116,9 +116,10 @@ internal static class Program
         Console.WriteLine();
         if (stage == HandshakeStage.Complete)
         {
-            Console.WriteLine("RESULT: MCS channel joined.");
-            Console.WriteLine("        Security negotiation and graphics are not implemented, "
-                              + "so no desktop will be displayed.");
+            Console.WriteLine("RESULT: connection finalised through the capability and "
+                          + "Synchronize/Control/Font List exchanges.");
+            Console.WriteLine("        Graphics and input are not implemented, so no "
+                              + "desktop will be displayed.");
             return 0;
         }
 

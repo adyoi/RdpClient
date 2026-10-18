@@ -53,14 +53,38 @@ exists for IntelliSense; everything non-obvious is documented at the member.
 | RSA key exchange, session keys, MCS encryption | 5.3.2 | Not started |
 | Client Info PDU, licensing skip | 1.3.1.1, 2.2.1.11 | **Verified against xrdp**; the Licensing PDU it triggers is skipped by structure |
 | Capability exchange | 2.2.7, 2.2.1.13 | **Verified against xrdp**: the Demand Active arrives and parses, the Confirm Active is answered without a server error |
-| Synchronize/Control/Font List, graphics and input | 2.2.9, 2.2.8 | Not started |
+| Synchronize / Control / Font List | 2.2.1.14-2.2.1.18 | **Verified against xrdp**: the server's Synchronize, Control (Cooperate and Granted Control) and Font Map PDUs all arrive and parse |
+| Graphics update, pointer and input | 2.2.9, 2.2.8 | Not started |
 
 Do not describe this as a working remote desktop client. It reaches TLS and
-authenticates nothing. Against xrdp it now completes the capability exchange:
-the client sends the Client Info PDU, reads the Licensing and Demand Active
-PDUs, and answers with a Confirm Active xrdp accepts. The session still shows
-no desktop: the Synchronize, Control and Font List sequence and every graphics
-or input PDU are unimplemented.
+authenticates nothing. Against xrdp it now completes the whole connection
+sequence: the client sends the Client Info PDU, reads the Licensing and Demand
+Active PDUs, answers with a Confirm Active xrdp accepts, then sends the
+Synchronize, Control (Cooperate and Request Control) and Font List PDUs as one
+batch and reads the server's Synchronize, Control and Font Map replies. The
+session still shows no desktop: every graphics, pointer and input PDU is
+unimplemented, so the server's output has nowhere to go.
+
+### Connection finalization goes out as one batch, not one read at a time
+
+MS-RDPBCGR 1.3.1.1 says the client-side PDUs of the finalization phase "have no
+dependencies on any of the server-to-client PDUs; they can be sent as a single
+batch, provided that sequencing is maintained". That sentence is load-bearing.
+Sending the Synchronize PDU and then reading before sending the Control PDU
+stalls the handshake, because the server is waiting for the rest of the batch
+rather than for anything from the client, so the read blocks on a reply that
+cannot be sent yet. The four PDUs go out in one run and the replies are read
+afterwards.
+
+`pduSource` in the Share Control Header is the MCS **user channel** (1001), not
+the global channel the PDUs travel on; the two are different fields and
+conflating them is the kind of thing the log will not name.
+
+The action values are the opposite of what the ordering suggests, which is why
+they are worth pinning: `CTRLACTION_COOPERATE` is **0x0004** and
+`CTRLACTION_REQUEST_CONTROL` is **0x0001** (MS-RDPBCGR 2.2.1.15, 2.2.1.16).
+Both client Control PDUs carry `grantId` and `controlId` set to zero; only the
+server's Granted Control PDU uses them.
 
 ## The client must read the server's answer
 

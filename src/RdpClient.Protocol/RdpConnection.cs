@@ -423,9 +423,23 @@ public sealed class RdpConnection : IAsyncDisposable
                         confirmActive.Length - Capability.ConfirmActiveSetsOffset))} "
                 + $"in {confirmActive.Length} bytes");
 
+            // --- 1.3.1.1 Connection Finalization ---
+            //
+            // The client Synchronize, Control (Cooperate), Control (Request
+            // Control) and Font List PDUs "have no dependencies on any of the
+            // server-to-client PDUs; they can be sent as a single batch"
+            // (MS-RDPBCGR 1.3.1.1). They are therefore sent in one run, and the
+            // server's replies are read afterwards. Reading between them is what
+            // stalled this client: the server is waiting for the batch, so a
+            // read that arrives first blocks on a reply that cannot be sent yet.
+            await SendFinalizationBatchAsync(assigned, demand.ShareId, cancellationToken)
+                .ConfigureAwait(false);
+            await ReadFinalizationRepliesAsync(cancellationToken).ConfigureAwait(false);
+
             Report(HandshakeStage.Complete,
-                "Capability exchange complete. Licensing, the Synchronize PDUs, graphics "
-                + "and input are not implemented yet, so the session will not display a desktop.");
+                "Connection finalization complete through the Synchronize, Control "
+                + "and Font List PDUs. Graphics and input are not implemented, so "
+                + "the session will not display a desktop.");
             return HandshakeStage.Complete;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -654,6 +668,185 @@ public sealed class RdpConnection : IAsyncDisposable
     }
 
     /// <summary>
+    /// Send the client Connection Finalization PDUs as one batch (MS-RDPBCGR
+    /// 1.3.1.1): Synchronize, Control (Cooperate), Control (Request Control) and
+    /// Font List, on the global channel.
+    /// </summary>
+    /// <remarks>
+    /// Each PDU is its own MCS Send Data Request, so a server reads them as
+    /// four PDUs in the order 1.3.1.1 lists them. They are deliberately not
+    /// interleaved with reads: the specification states these PDUs have no
+    /// dependency on any server-to-client PDU and may go out as one batch.
+    /// </remarks>
+    private async Task SendFinalizationBatchAsync(
+        ushort userId, int shareId, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(_channel);
+
+        // pduSource is the MCS user channel, per 2.2.8.1.1.1.2: the client
+        // stamps its own user channel rather than the global channel it sends on.
+        IReadOnlyList<byte[]> batch =
+            ConnectionFinalisation.BuildBatch(shareId, Rdp.McsUserChannel);
+
+        foreach (byte[] pdu in batch)
+        {
+            foreach (byte[] frame in Mcs.BuildSendDataRequest(userId, Rdp.McsGlobalChannel, pdu))
+            {
+                await _channel.WriteAsync(frame, cancellationToken).ConfigureAwait(false);
+            }
+
+            Report(HandshakeStage.ActiveConfirmed,
+                $"sent {ConnectionFinalisation.Describe(pdu)} ({pdu.Length} bytes)");
+        }
+
+        await _channel.FlushAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Read the server's Connection Finalization replies and report what
+    /// arrived: its Synchronize PDU, its Control (Cooperate) and Control
+    /// (Granted Control) PDUs, and the Font Map PDU.
+    /// </summary>
+    /// <remarks>
+    /// Bounded, because a server that omits any of them - or that answers with
+    /// something this client does not parse - must produce a reported failure
+    /// rather than a hang. The Client Info PDU triggered the Licensing PDU that
+    /// <see cref="ReadDemandActiveAsync"/> skips; a server is equally free to
+    /// interleave Set Error Info or Status Info PDUs here, so anything
+    /// unrecognised is skipped rather than treated as the end of the sequence.
+    /// </remarks>
+    private async Task ReadFinalizationRepliesAsync(CancellationToken cancellationToken)
+    {
+        bool sawSynchronize = false;
+        bool sawGrantedControl = false;
+        bool sawFontMap = false;
+
+        // One read past the last expected PDU would block, so the loop stops on
+        // what it has rather than on a read that returns nothing.
+        const int MaxReplies = 16;
+        for (int i = 0; i < MaxReplies && !(sawSynchronize && sawGrantedControl && sawFontMap); i++)
+        {
+            ConnectionFinalisation.ShareDataPduInfo? info = await ReadShareDataPduAsync(cancellationToken)
+                .ConfigureAwait(false);
+
+            if (info is null)
+            {
+                break;
+            }
+
+            switch (info.PduType2)
+            {
+                case ConnectionFinalisation.PduType2Synchronize:
+                    sawSynchronize = true;
+                    Report(HandshakeStage.ActiveConfirmed, "server sent a Synchronize PDU");
+                    break;
+
+                case ConnectionFinalisation.PduType2Control:
+                    if (info.Action == ConnectionFinalisation.ActionGrantedControl)
+                    {
+                        sawGrantedControl = true;
+                        Report(HandshakeStage.ActiveConfirmed,
+                            "server granted control of the session");
+                    }
+                    else
+                    {
+                        Report(HandshakeStage.ActiveConfirmed,
+                            $"server sent a Control PDU (action 0x{info.Action:x4})");
+                    }
+                    break;
+
+                case ConnectionFinalisation.PduType2FontMap:
+                    sawFontMap = true;
+                    Report(HandshakeStage.ActiveConfirmed, "server sent a Font Map PDU");
+                    break;
+
+                case ConnectionFinalisation.PduType2SetErrorInfo:
+                case ConnectionFinalisation.PduType2StatusInfo:
+                    Report(HandshakeStage.ActiveConfirmed,
+                        $"server sent a {ConnectionFinalisation.DescribePduType2(info.PduType2)} PDU");
+                    break;
+
+                default:
+                    Report(HandshakeStage.ActiveConfirmed,
+                        $"server sent an unrecognised PDU type 0x{info.PduType2:x2}, skipped");
+                    break;
+            }
+        }
+
+        if (!sawSynchronize)
+        {
+            throw new RdpProtocolException(
+                "the server never sent the Synchronize PDU that the connection sequence requires");
+        }
+
+        if (!sawGrantedControl)
+        {
+            throw new RdpProtocolException(
+                "the server never granted control, so it will not accept input");
+        }
+
+        if (!sawFontMap)
+        {
+            throw new RdpProtocolException(
+                "the server never sent the Font Map PDU, so it may not send text");
+        }
+    }
+
+    /// <summary>
+    /// Read one Share Data PDU, reassembling MCS fragments, and return its
+    /// parsed headers, or null when the peer only sent a T.128 FlowPDU.
+    /// </summary>
+    private async Task<ConnectionFinalisation.ShareDataPduInfo?> ReadShareDataPduAsync(
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(_channel);
+
+        var buffer = new MemoryStream();
+        bool gotPayload = false;
+
+        for (int fragment = 0; fragment <= Mcs.MaxSendDataFragments; fragment++)
+        {
+            var indication = Mcs.ParseSendDataIndication(
+                await ReadTpktAsync(cancellationToken).ConfigureAwait(false));
+
+            if (indication.ChannelId != Rdp.McsGlobalChannel)
+            {
+                // The finalization PDUs all travel on the global channel; a PDU
+                // for a virtual channel is not part of this phase.
+                if (indication.Segmentation is Mcs.SegmentationLast or Mcs.SegmentationSingle)
+                {
+                    return null;
+                }
+
+                continue;
+            }
+
+            gotPayload = true;
+            buffer.Write(indication.Payload, 0, indication.Payload.Length);
+
+            if (indication.Segmentation is Mcs.SegmentationLast or Mcs.SegmentationSingle)
+            {
+                break;
+            }
+        }
+
+        if (!gotPayload)
+        {
+            return null;
+        }
+
+        // A totalLength of 0x8000 introduces a T.128 FlowPDU, not a Share Data
+        // PDU (MS-RDPBCGR 2.2.8.1.1.1.1); it is skipped, not parsed.
+        byte[] pdu = buffer.ToArray();
+        if (pdu.Length >= 2 && pdu[0] == 0x00 && pdu[1] == 0x80)
+        {
+            return null;
+        }
+
+        return ConnectionFinalisation.Parse(pdu);
+    }
+
+    /// <summary>
     /// Repeat the RDP negotiation inside the CredSSP channel.
     /// </summary>
     /// <remarks>
@@ -723,7 +916,8 @@ public sealed class RdpConnection : IAsyncDisposable
         HandshakeStage.ChannelJoined => "the channel joins",
         HandshakeStage.ClientInfoSent => "the Client Info PDU; it never sent the Demand Active PDU",
         HandshakeStage.CapabilityExchanged => "the capability sets it demanded",
-        HandshakeStage.ActiveConfirmed => "the Confirm Active PDU",
+        HandshakeStage.ActiveConfirmed => "the Confirm Active PDU; the server never sent "
+            + "the Synchronize, Control or Font Map PDUs of the connection finalization",
         _ => stage.ToString(),
     };
 
