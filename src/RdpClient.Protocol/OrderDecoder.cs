@@ -182,16 +182,22 @@ public sealed class OrderDecoder
     private bool DecodeOne(ref SpanReader reader)
     {
         byte controlFlags = reader.U8();
-        bool isPrimary = (controlFlags & TsStandard) != 0;
-        bool isSecondary = (controlFlags & TsSecondary) != 0;
 
-        if (isPrimary)
+        // 2.2.2.1.1 fixes the three classes by which of the two bits are set,
+        // and the order of these tests is load-bearing: a secondary order sets
+        // BOTH TS_STANDARD and TS_SECONDARY (the header says so explicitly), so
+        // testing TS_STANDARD first sends every secondary order down the primary
+        // path and desynchronises the stream at the first Cache Bitmap.
+        bool hasStandard = (controlFlags & TsStandard) != 0;
+        bool hasSecondary = (controlFlags & TsSecondary) != 0;
+
+        if (hasStandard && !hasSecondary)
         {
             DecodePrimary(ref reader, controlFlags);
             return true;
         }
 
-        if (isSecondary)
+        if (hasStandard && hasSecondary)
         {
             // 2.2.2.2.1.2.1.1: orderLength(2) extraFlags(2) orderType(1), then
             // the body. orderLength is thirteen less than the real length, a
@@ -232,11 +238,10 @@ public sealed class OrderDecoder
             return true;
         }
 
-        // An alternate secondary order's header is a single octet whose low six
-        // bits are the order type (2.2.2.2.1.3.1.1). Unlike a secondary order it
-        // carries no length, so each type's own layout has to give one; the
-        // fixed-size types are handled here and the streamed ones are refused
-        // rather than stepped over by a guess.
+        // Only TS_SECONDARY is set, so this is an alternate secondary order.
+        // Its header is a single octet whose low six bits are the order type
+        // (2.2.2.2.1.3.1.1). Unlike a secondary order it carries no length of its
+        // own, so each type's layout has to give one.
         int altType = controlFlags & 0x3F;
         int altLength = AlternateSecondaryLength(altType, reader);
 
@@ -258,19 +263,26 @@ public sealed class OrderDecoder
     }
 
     /// <summary>
-    /// The length of an alternate secondary order, or -1 when its length is not
-    /// derivable from the octets that follow.
+    /// The length of an alternate secondary order <em>after</em> its header
+    /// octet, which the caller has already consumed, or -1 when its length is
+    /// not derivable from the octets that follow.
     /// </summary>
+    /// <remarks>
+    /// The specification states these lengths including the one-octet header.
+    /// Off by one here does not fail outright: it walks the stream one octet
+    /// further along per order until every later order is garbage.
+    /// </remarks>
     private static int AlternateSecondaryLength(int orderType, SpanReader reader)
     {
-        // header(1) plus the order's own fields (2.2.2.2.1.3).
+        // Each figure is the specification's total (2.2.2.2.1.3) less that
+        // header octet, because the caller has already read it.
         return orderType switch
         {
-            0x00 => 3,                       // Switch Surface: bitmapId(2)
-            0x01 => OffscreenBitmapLength(reader),
-            0x0B => 3,                       // Windowing: windowId(2)
-            0x0C => 6,                       // Desktop Composition: 2 * uint32
-            0x0D => 6,                       // Frame Marker: frameMarker(4) + frameAction(1)
+            0x00 => 3 - 1,                   // Switch Surface: bitmapId(2)
+            0x01 => OffscreenBitmapLength(reader) - 1,
+            0x0B => 3 - 1,                   // Windowing: windowId(2)
+            0x0C => 6 - 1,                   // Desktop Composition: 2 * uint32
+            0x0D => 6 - 1,                   // Frame Marker: frameMarker(4) + frameAction(1)
             _ => -1,
         };
     }
@@ -289,15 +301,17 @@ public sealed class OrderDecoder
 
         // flags(2) cx(2) cy(2); the d bit in flags says whether a delete
         // list follows, and this client advertises no offscreen cache, so an
-        // order that carries one cannot be stepped over safely.
-        int flags = reader.U16() | (reader.U16() << 16);
+        // order that carries one cannot be stepped over safely. The result
+        // includes this order's header octet, as every figure returned from
+        // AlternateSecondaryLength must.
+        int flags = reader.U16();
         int cx = reader.U16();
         int cy = reader.U16();
 
         _ = cx;
         _ = cy;
 
-        return (flags & 0x0001) != 0 ? -1 : 7;
+        return (flags & 0x0001) != 0 ? -1 : 1 + 6;
     }
 
     private void DecodePrimary(ref SpanReader reader, byte controlFlags)

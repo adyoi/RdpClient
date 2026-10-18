@@ -130,6 +130,19 @@ public sealed record RdpConnectionOptions
     /// </remarks>
     public int GraphicsPduLimit { get; init; }
 
+    /// <summary>
+    /// When set, the raw body of every graphics update is appended to this file
+    /// as a four-octet little-endian length followed by the body.
+    /// </summary>
+    /// <remarks>
+    /// This exists because a hex log line is truncated at the logger's line
+    /// limit, which turns a 639-octet orders update into its first sixteen
+    /// octets - exactly the part that is already understood. A decode defect in
+    /// an order stream is found by walking bytes against MS-RDPEGDI, and that
+    /// needs all of them, so the capture is a file rather than a log line.
+    /// </remarks>
+    public string? GraphicsCapturePath { get; init; }
+
     /// <summary>TLS protocol versions to offer. Defaults to TLS 1.2 and 1.3.</summary>
     public System.Security.Authentication.SslProtocols TlsPolicy { get; init; } =
         System.Security.Authentication.SslProtocols.Tls12 |
@@ -524,7 +537,9 @@ public sealed class RdpConnection : IAsyncDisposable
 
             if (options.GraphicsPduLimit > 0)
             {
-                await ReadGraphicsAsync(options.GraphicsPduLimit, options.LogTx, cancellationToken).ConfigureAwait(false);
+                await ReadGraphicsAsync(
+                    options.GraphicsPduLimit, options.LogTx,
+                    options.GraphicsCapturePath, cancellationToken).ConfigureAwait(false);
             }
 
             Report(HandshakeStage.Complete,
@@ -895,7 +910,8 @@ public sealed class RdpConnection : IAsyncDisposable
     /// malformed rectangle has still proved the path works for every other one,
     /// and aborting the connection over one bad rectangle hides that.
     /// </remarks>
-    private async Task ReadGraphicsAsync(int limit, bool hex, CancellationToken cancellationToken)
+    private async Task ReadGraphicsAsync(
+        int limit, bool hex, string? capturePath, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(_channel);
 
@@ -950,6 +966,8 @@ public sealed class RdpConnection : IAsyncDisposable
                 }
 
                 byte[] body = await ReadPduBodyAsync(info, cancellationToken).ConfigureAwait(false);
+
+                CaptureGraphicsBody(capturePath, body);
 
                 if (hex)
                 {
@@ -1188,6 +1206,29 @@ public sealed class RdpConnection : IAsyncDisposable
             + "the Synchronize, Control or Font Map PDUs of the connection finalization",
         _ => stage.ToString(),
     };
+
+    /// <summary>Append one graphics update body to the capture file.</summary>
+    private static void CaptureGraphicsBody(string? path, byte[] body)
+    {
+        if (path is null)
+        {
+            return;
+        }
+
+        // Length-prefixed rather than concatenated: an orders update has no
+        // delimiter of its own, so without a count the file could not be split
+        // back into the updates it was made of.
+        byte[] record = new byte[body.Length + 4];
+        record[0] = (byte)body.Length;
+        record[1] = (byte)(body.Length >> 8);
+        record[2] = (byte)(body.Length >> 16);
+        record[3] = (byte)(body.Length >> 24);
+        body.CopyTo(record, 4);
+
+        using var stream = new FileStream(
+            path, FileMode.Append, FileAccess.Write, FileShare.Read);
+        stream.Write(record, 0, record.Length);
+    }
 
     /// <summary>Format bytes as offset-prefixed hex, for protocol debugging.</summary>
     private static string Hex(byte[] data)

@@ -117,6 +117,19 @@ internal static class Program
 
         string? bmpPath = Get(options, "dump-bmp");
 
+        if (options.TryGetValue("dump-graphics", out string? capturePath))
+        {
+            // Truncated at the start rather than appended to: a second run
+            // would otherwise leave two sessions' updates interleaved in one
+            // file, which is indistinguishable from a stream that desynced.
+            if (File.Exists(capturePath))
+            {
+                File.Delete(capturePath);
+            }
+
+            connectionOptions = connectionOptions with { GraphicsCapturePath = capturePath };
+        }
+
         if (options.ContainsKey("classic-user"))
         {
             // Off by default: the block puts the password on the wire in the
