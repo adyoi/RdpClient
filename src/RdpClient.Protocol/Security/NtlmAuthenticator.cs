@@ -103,7 +103,7 @@ public sealed class NtlmAuthenticator
         // copy, which is what the server unwraps to derive the same value.
         bool keyExchange = challenge.Flags.HasFlag(NtlmFlags.NegotiateKeyExchange);
         byte[] sessionBaseKey = Ntlm.ComputeSessionBaseKey(
-            ntlmResponse, (NtlmFlags)BitConverter.ToUInt32(negotiate, 12));
+            ntHash, _userName, _domain, ntlmResponse);
         byte[] sessionKey = keyExchange ? RandomNumberGenerator.GetBytes(16) : sessionBaseKey;
         byte[] encryptedSessionKey = Ntlm.ExportSessionKey(sessionBaseKey, sessionKey);
 
@@ -112,15 +112,29 @@ public sealed class NtlmAuthenticator
             _domain,
             _workstation,
             ntlmResponse,
-            challenge.Flags & NtlmFlags.NegotiateUnicode,
+            (NtlmFlags)((uint)Ntlm.ClientFlags & (uint)challenge.Flags),
             challenge.ServerChallenge.Span,
             encryptedSessionKey);
 
-        // MS-NLMP 3.1.5.1.2: the MIC covers all three messages and is keyed with
-        // the session key, not the session base key. Without it the server
-        // cannot tell an unmodified exchange from a tampered one and answers
-        // SEC_E_INVALID_TOKEN.
-        Ntlm.ComputeMic(sessionKey, negotiate, challengeToken, authenticate)
+        // MS-NLMP 3.1.5.1.2: the MIC covers all three messages. The copy of the
+        // AUTHENTICATE used in the computation must have its MIC field zeroed,
+        // and, when NEGOTIATE_KEY_EXCHANGE is in force, its
+        // EncryptedRandomSessionKey zeroed too; otherwise the MIC is computed
+        // over bytes that differ from what the server reconstructs and the
+        // server answers SEC_E_INVALID_TOKEN.
+        byte[] authenticateForMic = (byte[])authenticate.Clone();
+        authenticateForMic.AsSpan(Ntlm.MicOffset, Ntlm.MicLength).Clear();
+        if (keyExchange)
+        {
+            int keyOffset = (int)BitConverter.ToUInt32(authenticate, 56);
+            int keyLength = BitConverter.ToUInt16(authenticate, 52);
+            if (keyOffset + keyLength <= authenticateForMic.Length)
+            {
+                authenticateForMic.AsSpan(keyOffset, keyLength).Clear();
+            }
+        }
+
+        Ntlm.ComputeMic(sessionKey, negotiate, challengeToken, authenticateForMic)
             .CopyTo(authenticate.AsSpan(Ntlm.MicOffset));
 
         // MS-CSSP 3.1.5 step 3: CredSSP version 5 and above bind the TLS channel

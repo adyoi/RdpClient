@@ -42,17 +42,20 @@ public class NtlmSessionTests
     }
 
     [Fact]
-    public void SessionBaseKey_IsTheFirst16BytesOfHmacMd5OverTheProfferedFlags()
+    public void SessionBaseKey_IsHmacMd5OfTheNtowfv2OverTheProofString()
     {
-        // MS-NLMP 3.4.4.2: T = HMAC_MD5(NTLMv2_Response,
-        // ProfferedNegotiateFlags)[0..16], with the flags as 4 LE bytes.
+        // MS-NLMP 3.3.2 / 3.4.4.2: SessionBaseKey =
+        // HMAC_MD5(ResponseKeyNT, NTProofStr), where ResponseKeyNT = NTOWFv2 and
+        // NTProofStr is the first 16 octets of the NTLMv2 response.
+        byte[] ntHash = RandomNumberGenerator.GetBytes(16);
+        const string User = "alice";
+        const string Domain = "CORP";
         byte[] response = RandomNumberGenerator.GetBytes(32);
-        const NtlmFlags Flags = NtlmFlags.NegotiateUnicode | NtlmFlags.NegotiateNtlm;
 
-        using var hmac = new HMACMD5(response);
-        byte[] expected = hmac.ComputeHash(BitConverter.GetBytes((uint)Flags))[..16];
+        byte[] ntowfv2 = HMACMD5.HashData(ntHash, Encoding.Unicode.GetBytes(User.ToUpperInvariant() + Domain));
+        byte[] expected = HMACMD5.HashData(ntowfv2, response.AsSpan(0, 16).ToArray());
 
-        Assert.Equal(ToHex(expected), ToHex(Ntlm.ComputeSessionBaseKey(response, Flags)));
+        Assert.Equal(ToHex(expected), ToHex(Ntlm.ComputeSessionBaseKey(ntHash, User, Domain, response)));
     }
 
     [Fact]

@@ -296,20 +296,38 @@ public static class Ntlm
             : [];
 
     /// <summary>
-    /// Derive the NTLMv2 session base key (MS-NLMP 3.4.4.2).
+    /// Derive the NTLMv2 session base key (MS-NLMP 3.3.2, 3.4.4.2).
     /// </summary>
     /// <remarks>
-    /// <c>T = HMAC_MD5(NTLMv2_Response, ProfferedNegotiateFlags)[0..16]</c>.
-    /// The flags are the ones this client sent in NEGOTIATE, not the ones the
-    /// server returned, and they are hashed as 4 little-endian bytes.
+    /// <c>SessionBaseKey = HMAC_MD5(ResponseKeyNT, NTProofStr)</c>, where
+    /// <c>ResponseKeyNT = NTOWFv2 = HMAC_MD5(NT hash, UTF-16LE(Uppercase(user) + domain))</c>
+    /// and <c>NTProofStr</c> is the first 16 octets of the NTLMv2 challenge
+    /// response. For NTLMv2 the key exchange key equals this value (MS-NLMP
+    /// 3.4.5.1), so it is also what RC4-wraps the exported session key.
     /// </remarks>
+    /// <param name="ntHash">The NT hash of the account password.</param>
+    /// <param name="userName">Account name; uppercased into the key derivation.</param>
+    /// <param name="domain">Account domain; matches the server's target name.</param>
     /// <param name="ntlmResponse">The NTLMv2 challenge response.</param>
-    /// <param name="profferedFlags">The <c>NegotiateFlags</c> this client sent.</param>
-    public static byte[] ComputeSessionBaseKey(ReadOnlySpan<byte> ntlmResponse, NtlmFlags profferedFlags)
+    public static byte[] ComputeSessionBaseKey(
+        byte[] ntHash,
+        string userName,
+        string domain,
+        ReadOnlySpan<byte> ntlmResponse)
     {
-        using var hmac = new HMACMD5(ntlmResponse.ToArray());
-        byte[] hash = hmac.ComputeHash(BitConverter.GetBytes((uint)profferedFlags));
-        return hash[..16];
+        ArgumentNullException.ThrowIfNull(ntHash);
+        ArgumentNullException.ThrowIfNull(userName);
+        ArgumentNullException.ThrowIfNull(domain);
+
+        if (ntlmResponse.Length < 16)
+        {
+            throw new ArgumentException(
+                "the NTLMv2 response must carry at least the 16-octet proof string",
+                nameof(ntlmResponse));
+        }
+
+        byte[] ntowfv2 = HMACMD5.HashData(ntHash, Encoding.Unicode.GetBytes(userName.ToUpperInvariant() + domain));
+        return HMACMD5.HashData(ntowfv2, ntlmResponse[..16].ToArray());
     }
 
     /// <summary>
@@ -317,13 +335,13 @@ public static class Ntlm
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <c>MAC = HMAC_MD5(SessionBaseKey, NEGOTIATE || CHALLENGE || AUTHENTICATE)</c>
+    /// <c>MAC = HMAC_MD5(ExportedSessionKey, NEGOTIATE || CHALLENGE || AUTHENTICATE)</c>
     /// where the AUTHENTICATE copy has its MIC field zeroed and, when
     /// <see cref="NtlmFlags.NegotiateKeyExchange"/> is in force, its
     /// EncryptedRandomSessionKey zeroed too.
     /// </para>
     /// <para>
-    /// The key is the session <em>base</em> key, not the session key.
+    /// The key is the exported (negotiated) session key, not the session base key.
     /// </para>
     /// </remarks>
     /// <param name="sessionBaseKey">From <see cref="ComputeSessionBaseKey"/>.</param>
