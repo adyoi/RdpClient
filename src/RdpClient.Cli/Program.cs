@@ -165,8 +165,14 @@ internal static class Program
             }
 
             Console.WriteLine(
-                $"RESULT: connection finalised; {connection.GraphicsUpdatesApplied} "
-                + "graphics update(s) applied.");
+                $"RESULT: connection finalised; {connection.GraphicsUpdatesRead} graphics "
+                + $"update(s) read, {connection.GraphicsUpdatesApplied} applied.");
+            if (connection.GraphicsUpdatesApplied == 0 && connection.GraphicsUpdatesRead > 0)
+            {
+                Console.WriteLine("        The server sent a framebuffer this client could not "
+                                  + "decode; see AGENTS.md, 'The order stream from xrdp does not "
+                                  + "decode yet'.");
+            }
             Console.WriteLine("        Input is not implemented, so the session is "
                               + "not interactive.");
             return 0;

@@ -223,6 +223,19 @@ public sealed class RdpConnection : IAsyncDisposable
     /// <summary>How many graphics update PDUs have been read and painted.</summary>
     public int GraphicsUpdatesApplied { get; private set; }
 
+    /// <summary>
+    /// Update bodies that were read off the wire, whether or not the decoder
+    /// understood them.
+    /// </summary>
+    /// <remarks>
+    /// Kept apart from <see cref="GraphicsUpdatesApplied"/> because the two
+    /// failures are different reports: nothing arriving means the server never
+    /// sent a framebuffer, while something arriving and applying to nothing
+    /// means this client cannot read the one it did send. A single counter
+    /// reads as "no graphics" for both.
+    /// </remarks>
+    public int GraphicsUpdatesRead { get; private set; }
+
     /// <summary>Raised after each batch of bitmap updates has been painted.</summary>
     public event Action<ScreenSurface>? OnSurfaceUpdated;
 
@@ -546,9 +559,15 @@ public sealed class RdpConnection : IAsyncDisposable
                 GraphicsUpdatesApplied > 0
                     ? $"Connection finalization complete and {GraphicsUpdatesApplied} graphics "
                         + $"update(s) painted onto a {DesktopWidth}x{DesktopHeight} surface."
-                    : "Connection finalization complete through the Synchronize, Control "
-                        + "and Font List PDUs. No graphics have arrived, and input is not "
-                        + "implemented, so no desktop is displayed.");
+                    : GraphicsUpdatesRead > 0
+                        ? "Connection finalization complete, and the server sent "
+                            + $"{GraphicsUpdatesRead} graphics update(s) - but none of them decoded, "
+                            + "so nothing reached the surface. Input is not implemented either, "
+                            + "so no desktop is displayed. The order stream is recorded in "
+                            + "AGENTS.md, section 'The order stream from xrdp does not decode yet'."
+                        : "Connection finalization complete through the Synchronize, Control "
+                            + "and Font List PDUs, and the server sent no graphics update at "
+                            + "all. Input is not implemented, so no desktop is displayed.");
             return HandshakeStage.Complete;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -941,7 +960,8 @@ public sealed class RdpConnection : IAsyncDisposable
             {
                 // The deadline, not a protocol fault: whatever arrived is kept.
                 Report(HandshakeStage.Complete,
-                    $"stopped after {GraphicsUpdatesApplied} graphics update(s): the deadline passed");
+                    $"stopped after {GraphicsUpdatesRead} graphics update(s) read "
+                        + $"({GraphicsUpdatesApplied} applied): the deadline passed");
                 break;
             }
 
@@ -968,6 +988,7 @@ public sealed class RdpConnection : IAsyncDisposable
                 byte[] body = await ReadPduBodyAsync(info, cancellationToken).ConfigureAwait(false);
 
                 CaptureGraphicsBody(capturePath, body);
+                GraphicsUpdatesRead++;
 
                 if (hex)
                 {

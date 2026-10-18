@@ -8,13 +8,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 The CredSSP envelope, which was missing entirely, plus the MCS client data and
-channel-setup encodings, which xrdp rejected outright. The connection now
-completes the channel joins **and the mandatory capability exchange** against
-xrdp. The step the whole sequence was missing turned out to be the Client Info
-PDU - the Secure Settings Exchange that MS-RDPBCGR 1.3.1.1 places between the
-joins and the Capabilities Exchange.
+channel-setup encodings, which xrdp rejected outright. The connection now runs
+end to end against xrdp: the Client Info PDU - the Secure Settings Exchange that
+MS-RDPBCGR 1.3.1.1 places between the joins and the Capabilities Exchange -
+followed by the capability exchange and the connection finalization batch, with
+every server reply read rather than assumed. The graphics stream is then read
+and dispatched instead of ignored, and stops short of a picture: the drawing
+orders xrdp sends do not decode, which is recorded under Known gaps with the
+measurements that pin it down.
 
 ### Added
+
+- **Connection finalization is implemented and verified against xrdp**
+  (MS-RDPBCGR 2.2.1.14-2.2.1.18). The client's Synchronize, Control (Cooperate
+  and Request Control) and Font List PDUs go out as one batch - the clause in
+  1.3.1.1 that permits this is load-bearing, because reading between sends
+  blocks on a reply the server cannot produce while it is waiting for the rest
+  of the batch - and the server's Synchronize, Control (Cooperate and Granted
+  Control) and Font Map replies are all read and parsed. `pduSource` is the MCS
+  user channel 1001, not the global channel these PDUs travel on.
+- **Graphics updates are read, parsed and dispatched.** `BitmapUpdate.cs` walks
+  an update body by its `updateType`, `UncompressedBitmap.cs` and `RleBitmap.cs`
+  decode the two bitmap forms, `BulkDecompressor.cs` inflates the bulk-compressed
+  RDP 6.0 stream, and `ScreenSurface.cs` composites rectangles, copies regions
+  and blits cached bitmaps into an in-memory desktop that `ToBmp` writes out.
+  This is verified only as far as *reading*; see Known gaps for why no picture
+  has come out of it yet.
+- **`--dump-bmp <path>`** writes the composited surface to a BMP so a run can be
+  inspected after the fact rather than only while it is running.
+- **`--dump-graphics <path>`** appends every graphics update body to a file as a
+  four-octet little-endian length followed by the body. It exists because `--hex`
+  cannot serve the same purpose: `Hex()` breaks after sixteen octets, the logger
+  keeps the first line, and a 639-octet Orders Update was therefore being logged
+  as its first sixteen octets - precisely the part that was already understood.
+  Walking a misparsing order stream against MS-RDPEGDI needs all of them.
+- **`OrderDecoderTests`** pins the three order-stream defects found by tracing a
+  live update: the order-class test, the alternate secondary length off-by-one,
+  and `numberOrders` being read from `pad2OctetsA`'s offset. Each is asserted as
+  "the decoder stopped exactly at the end of the order data", because an order
+  stream one octet out of step still names plausible orders for as long as the
+  bytes ahead of it decode.
 
 - **The connection log can be copied.** The header now carries `Copy log` and
   `Clear`. The copied text starts with the target, stage and account, because a
@@ -63,6 +96,22 @@ joins and the Capabilities Exchange.
 
 ### Fixed
 
+- **A secondary order was tested as a primary one.** `controlFlags = 0x03` sets
+  both `TS_STANDARD` and `TS_SECONDARY`, and testing `TS_STANDARD` first sent
+  every secondary order down the primary path, which then read the secondary
+  header's own bytes as field flags and walked onward without ever failing. The
+  class test now checks the secondary bit first (MS-RDPEGDI 2.2.2.1.1). Commit
+  `848e8ed` claimed this fix and did not contain it - see the convention in
+  AGENTS.md about a commit message describing the tree - so it is re-applied
+  here and pinned by a test.
+- **Alternate secondary orders skipped one octet too many.** The lengths in
+  MS-RDPEGDI 2.2.2.2.1.3 count the header octet, which the caller has already
+  consumed by the time it asks; returning the specification's figure walked the
+  stream one octet forward per order and never produced an error of its own.
+- **Create Offscreen Bitmap read flags as two u16 values.** It OR-ed a byte and
+  a byte into `flags`, over-reading two octets of the two-octet `flags` field it
+  was given, so the following `deltaWidth` was taken from the next order's
+  header.
 - **The T.125 SendDataRequest/SendDataIndication length was a little-endian u16
   "including itself".** The real field is an [ITU-T X.691] length determinant,
   in both directions: one octet at or below 127, otherwise two big-endian
@@ -242,12 +291,33 @@ joins and the Capabilities Exchange.
   capability exchange completes end to end; see the added and fixed entries.
   The `mstsc` tap capture stayed unreadable under TLS 1.3, so this answer came
   from xrdp's own sources plus a live probe against them.
-- **Everything after the Confirm Active is unimplemented.** The Synchronize,
-  Control and Font List send sequence, the Font Map reply, and all graphics and
-  input PDUs are still missing, so the probe stops after the capability
-  exchange: the session would show no desktop even on a server that got this
-  far. xrdp also sends sets the client does not interpret (bitmap codecs,
-  surface commands, frame acknowledge among the 14); the client's Confirm
+- **RESOLVED 2026-10-18: connection finalization is implemented.** The
+  Synchronize, Control and Font List send sequence and the Font Map reply, which
+  the previous draft listed here as missing, are now sent as one batch and read
+  back against xrdp.
+- **OPEN 2026-10-18: the drawing order stream from xrdp does not decode, so
+  there is still no desktop.** The graphics phase is reached and every Orders
+  Update body is read and captured, but `OrderDecoder` cannot walk xrdp's order
+  stream. Against one 639-octet update the facts are measured rather than
+  inferred: `numberOrders` is **193**; the first order is a Cache Bitmap -
+  Revision 2 whose `orderLength` says **17** octets while the next order starts
+  **70** octets in; what follows is eleven tiles of exactly **51** octets, and
+  70 + 11 x 51 = 631, which is the whole order data - but that layout explains
+  only 1 + 11 x 16 = **177** orders. Those four numbers do not reconcile, and
+  MS-RDPEGDI 2.2.2.2.1.2.1.1 says `orderLength` "MUST be 13 bytes less than the
+  actual order length", which 4 + 13 = 17 does not satisfy. The measurements,
+  the capture procedure and the rule against guessing `bitmapLength`'s offset are
+  in [AGENTS.md](AGENTS.md#the-order-stream-from-xrdp-does-not-decode-yet).
+  This is reported as a failure rather than as a
+  partial success: a run ends with `1 graphics update(s) read, 0 applied`.
+- **No live server has exercised the bitmap path.** The captures taken so far
+  hold only an Orders Update and a Synchronize Update, and no rendered surface
+  has ever been written to disk from a real session, so the bitmap and bulk
+  compression code is compiled and unit-level only.
+- **Input and pointer PDUs are unimplemented**, so even a decoding desktop could
+  not be used: nothing can be sent back.
+- **xrdp also sends capability sets the client does not interpret** (bitmap
+  codecs, surface commands, frame acknowledge among the 14); the client's Confirm
   Active advertises only the General set, which xrdp accepts, but real
   downgrading behaviour is unverified.
 - **`TS_UD_CS_CORE` is 234 octets on the strength of the specification and

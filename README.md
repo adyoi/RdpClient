@@ -27,9 +27,11 @@ anything.
 The goal is a client you control and can read, for interoperability with Windows RDP hosts and
 for understanding the protocol itself.
 
-> **Status: connection sequence only.** See [Scope](#scope-what-works-and-what-does-not) below
-> for exactly what is implemented. Security negotiation, graphics and input are **not**
-> implemented, so the app does not display a remote desktop yet.
+> **Status: connection sequence complete, desktop not yet drawn.** See [Scope](#scope-what-works-and-what-does-not)
+> for exactly what is implemented. The client negotiates, authenticates its way
+> into a session and completes connection finalization against xrdp, then reads
+> the graphics stream - but the drawing orders xrdp sends do not decode, so the
+> app still does not display a remote desktop. Input is not implemented.
 
 ![RdpClient main window](docs/assets/screenshot-main.png)
 
@@ -53,8 +55,9 @@ See [docs/research.md](docs/research.md) for the analysis and its limitations.
 
 ## Scope: what works and what does not
 
-Honesty here matters more than a feature checklist. The connection sequence is implemented and
-verified against a live server. Everything after channel join is not.
+Honesty here matters more than a feature checklist. Every step through connection
+finalization is implemented and verified against a live server. Graphics are read
+but do not yet decode, and input does not exist.
 
 | Layer | Spec | Status |
 | --- | --- | --- |
@@ -65,9 +68,12 @@ verified against a live server. Everything after channel join is not.
 | Erect Domain / Attach User / Channel Join | 2.2.1.5, .6, .8 | **Verified against xrdp**; replies parsed |
 | RSA key exchange, RC4 / AES session keys | 2.2.1.4.3, 5.3.2 | Not started |
 | TLS handshake for the External Security Protocol | MS-RDPEA 3.1.5.1 | **Works** (verified) |
-| CredSSP / NLA — SPNEGO + NTLM | MS-NLMP, MS-RDPEA | Incomplete |
-| Capability set exchange | 2.2.7 | Not started |
-| Bitmap / pointer / order graphics pipeline | 2.2.9 | Not started |
+| CredSSP / NLA — SPNEGO + NTLM | MS-NLMP, MS-RDPEA | Incomplete; the host now reports `STATUS_LOGON_FAILURE` instead of rejecting the token, so the credentials are what fail |
+| Client Info PDU and licensing | 2.2.1.11, 1.3.1.1 | **Verified against xrdp** |
+| Capability set exchange | 2.2.7, 2.2.1.13 | **Verified against xrdp** |
+| Synchronize / Control / Font List | 2.2.1.14–.18 | **Verified against xrdp** |
+| Graphics: reading updates, bitmap path | 2.2.9.1.1.3 | **Read and dispatched, not verified** — no live bitmap update has been decoded |
+| Graphics: drawing orders | MS-RDPEGDI 2.2.2.2.1 | **Implemented, does not decode xrdp's stream** |
 | Keyboard and pointer input | 2.2.8 | Not started |
 | Virtual channel data (clipboard, drive, audio) | 2.2.6 | Not started |
 
@@ -77,14 +83,21 @@ client stops there and says why. Windows also refuses `PROTOCOL_SSL` on its own
 with failure code 5, `SSL_REQUIRED_BY_SERVER`, because it wants NLA, so that host
 cannot exercise anything past TLS.
 
-Against **xrdp** the client now completes the whole MCS channel join: the server
+Against **xrdp** the client completes the entire connection sequence. The server
 parses the Connect Initial and its client data blocks, answers the Connect
-Response, attaches the user, and accepts the channel join of the MCS global
-channel 1003. Both server replies are read and parsed, so the reported result
-reflects what the server actually said. The next PDU in the exchange is the
-Demand Active, which begins the capability exchange - see
+Response, attaches the user, accepts all ten Channel Join Requests, reads the
+Client Info PDU and answers with Licensing and Demand Active, accepts the
+Confirm Active, and finally answers the client's Synchronize, Control and Font
+List PDUs with its own Synchronize, Control (Cooperate and Granted Control) and
+Font Map. Every one of those replies is read and parsed, so the reported result
+reflects what the server actually said. See
 [the changelog](CHANGELOG.md) for the byte-level record and
 [the xrdp log excerpt](docs/wsl-rdp-lab.md#10-read-the-servers-log-before-theorising).
+
+After that the client reads the graphics stream - and stops short of a picture.
+xrdp sends Orders Updates and the decoder cannot walk them, so the run ends with
+`1 graphics update(s) read, 0 applied` and no desktop. The measurements that pin
+down why are in [AGENTS.md](AGENTS.md#the-order-stream-from-xrdp-does-not-decode-yet).
 
 ### What stands between this and the login screen
 
@@ -95,12 +108,14 @@ Reaching it requires, in dependency order:
 | --- | --- | --- |
 | X.224 negotiation | 2.2.1.1 | Done |
 | TLS handshake | MS-RDPEA 3.1.5.1 | Done |
-| SPNEGO + NTLM | MS-NLMP | Incomplete |
+| SPNEGO + NTLM | MS-NLMP | Incomplete — host reports `STATUS_LOGON_FAILURE` |
 | CredSSP renegotiation | MS-RDPEA 3.2.1.5.1.5 | Written, not yet reachable |
 | RSA key exchange, session keys, MCS encryption | MS-RDPBCGR 5.3.2 | Not started |
-| Capability exchange (`Demand Active` / `Confirm Active`) | 2.2.7 | Not started |
-| Early User Authorization and logon information | 2.2.10.2 | Not started |
-| Bitmap and pointer rendering | 2.2.9 | Not started |
+| Capability exchange (`Demand Active` / `Confirm Active`) | 2.2.7 | **Done, verified against xrdp** |
+| Connection finalization | 2.2.1.14–.18 | **Done, verified against xrdp** |
+| Drawing order decoding | MS-RDPEGDI 2.2.2.2.1 | Implemented, does not decode the stream yet |
+| Bitmap rendering | 2.2.9 | Read and dispatched, never verified against a live server |
+| Keyboard and pointer input | 2.2.8 | Not started |
 
 ## Prebuilt binaries
 
@@ -234,6 +249,7 @@ docs/                   Protocol notes, research, architecture
 | [docs/architecture.md](docs/architecture.md) | Project structure and design decisions |
 | [docs/research.md](docs/research.md) | Analysis of `mstsc.exe` / `mstscax.dll` and what it revealed |
 | [docs/wsl-rdp-lab.md](docs/wsl-rdp-lab.md) | Standing up xrdp in WSL as a second server to test against |
+| [AGENTS.md](AGENTS.md) | Working notes: the honest status table, the wire-format invariants, and the measurements behind every open defect |
 | [CHANGELOG.md](CHANGELOG.md) | Release history |
 
 ## Security

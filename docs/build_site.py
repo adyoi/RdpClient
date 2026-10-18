@@ -43,6 +43,7 @@ PAGES = [
     ("research.html", "Research", "docs/research.md"),
     ("wsl-rdp-lab.html", "WSL test lab", "docs/wsl-rdp-lab.md"),
     ("changelog.html", "Changelog", "CHANGELOG.md"),
+    ("agents.html", "Working notes", "AGENTS.md"),
     ("contributing.html", "Contributing", "CONTRIBUTING.md"),
 ]
 
@@ -56,6 +57,7 @@ NAV = [
     ("research.html", "Research", "cls_research"),
     ("wsl-rdp-lab.html", "WSL test lab", "cls_wsl"),
     ("changelog.html", "Changelog", "cls_changelog"),
+    ("agents.html", "Working notes", "cls_agents"),
     ("contributing.html", "Contributing", "cls_contributing"),
 ]
 
@@ -109,6 +111,7 @@ TEMPLATE = string.Template("""<!DOCTYPE html>
     <a href="wsl-rdp-lab.html" class="$CLS_WSL">WSL test lab</a>
     <div class="navlabel">Project</div>
     <a href="changelog.html" class="$CLS_CHANGELOG">Changelog</a>
+    <a href="agents.html" class="$CLS_AGENTS">Working notes</a>
     <a href="contributing.html" class="$CLS_CONTRIBUTING">Contributing</a>
     <div class="navlabel">Elsewhere</div>
     <a href="https://github.com/adyoi/RdpClient">Repository</a>
@@ -364,11 +367,22 @@ HERO_RE = re.compile(
 def read_version() -> str:
     """Single source of truth for the version string shown in the sidebar.
 
-    Prefers an explicit <Version> in the protocol project, because that is what
-    the assembly reports and what the changelog is written against. Falls back
-    to the SDK default rather than printing a stray "v", which is what an
-    earlier version of this function did when it found nothing.
+    The newest released heading in the changelog wins, because that is the file
+    a reader checks to see what changed and it is bumped when a release is cut.
+    An explicit <Version> in the protocol project is the next choice: that is
+    what the assembly reports. Falls back to the SDK default rather than
+    printing a stray "v", which is what an earlier version of this function did
+    when it found nothing - and rather than reporting 1.0.0 after 1.1.0 had been
+    published, which is what the fallback below used to do on its own.
     """
+    changelog = ROOT / "CHANGELOG.md"
+    if changelog.is_file():
+        match = re.search(
+            r"^## \[(\d+\.\d+\.\d+)\]", changelog.read_text(encoding="utf-8"), re.M
+        )
+        if match:
+            return f"v{match.group(1)}"
+
     project = ROOT / "src" / "RdpClient.Protocol" / "RdpClient.Protocol.csproj"
     if project.is_file():
         text = project.read_text(encoding="utf-8")
@@ -450,11 +464,20 @@ def rewrite_links(body: str) -> str:
     capital letter - CHANGELOG.md, CONTRIBUTING.md, AGENTS.md - stayed pointed
     at a file the site does not serve. Anything with no rendered counterpart
     now goes to the repository on GitHub instead of nowhere.
+
+    The fragment is part of the match. The first version of this function
+    matched only through ``.md`` and closed the quote there, which turned
+    ``href="AGENTS.md#the-order-stream"`` into
+    ``href="agents.html"#the-order-stream"`` - an anchor stranded outside the
+    attribute, so every heading link to another document was a dead 404. That
+    is not visible on GitHub, where the Markdown is served unchanged, which is
+    why it survived several rounds of documentation edits.
     """
 
     # href="CHANGELOG.md" -> href="changelog.html"
     def to_html(match: re.Match) -> str:
         target = match.group(2)
+        fragment = match.group(3) or ""
         # A document under docs/ refers to a repository-root file as ../NAME,
         # and prefixing that verbatim produced blob/main/../NAME.
         target = re.sub(r"^(\.\./)+", "", target)
@@ -462,10 +485,10 @@ def rewrite_links(body: str) -> str:
         known = {name for name, _label, _src in PAGES}
         rendered = f"{stem}.html"
         if rendered in known:
-            return f'href="{rendered}"'
-        return f'href="{BLOB}/{target}"'
+            return f'href="{rendered}{fragment}"'
+        return f'href="{BLOB}/{target}{fragment}"'
 
-    body = re.sub(r'href="(docs/)?([A-Za-z0-9_\-./]+\.md)', to_html, body)
+    body = re.sub(r'href="(docs/)?([A-Za-z0-9_\-./]+\.md)(#[^"]*)?', to_html, body)
 
     # LICENSE and other non-Markdown repository files are not rendered either.
     body = re.sub(
@@ -563,7 +586,7 @@ NOT_FOUND = """<!DOCTYPE html>
 <main style="max-width:60ch;margin:12vh auto;padding:0 24px">
   <p class="ok" style="letter-spacing:.1em;font-size:.8rem">404</p>
   <h1 style="margin-bottom:.3em">That page is not here</h1>
-  <p style="color:var(--muted)">The documentation has seven pages. One of them
+  <p style="color:var(--muted)">The documentation has eight pages. One of them
   is probably the one you wanted.</p>
   <p style="margin-top:1.6em">
     <a class="ok" href="/RdpClient/">Overview</a> &nbsp;&middot;&nbsp;

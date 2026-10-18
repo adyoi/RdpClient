@@ -4,11 +4,12 @@
 
 ```text
 src/
-  RdpClient.Protocol/    Protocol core — no UI dependency, plain .NET
-  RdpClient.App/         WinUI 3 front end — Windows only
+  RdpClient.Protocol/    Protocol core - no UI dependency, plain .NET
+  RdpClient/             WinUI 3 front end - Windows only
   RdpClient.Cli/         rdpprobe: console handshake harness
 tests/
   RdpClient.Protocol.Tests/
+tools/                   rdp-tap.mjs and friends
 docs/
 ```
 
@@ -89,6 +90,36 @@ the UI `DispatcherQueue` and marshals before touching observable state.
 defects were only diagnosable with a byte dump, and the fixes needed to be
 reproducible.
 
+### The rest of the handshake
+
+`ClientInfo.cs` builds the Client Info PDU, `Capability.cs` builds and parses
+the Demand Active / Confirm Active exchange, and `ConnectionFinalisation.cs`
+holds the Synchronize, Control and Font List PDUs plus the Share Data PDU framing
+that every later update arrives inside. `Security/` carries `TlsChannel`,
+`CredSsp`, `Ntlm`/`NtlmAuthenticator`, `Md4` and `Rc4`.
+
+### The graphics path
+
+Six files, in the order a pixel travels through them:
+
+| File | Responsibility |
+| --- | --- |
+| `BitmapUpdate.cs` | Reads an update body's `updateType` and dispatches it; owns the rectangle type the surface paints |
+| `UncompressedBitmap.cs` | The raw bitmap form |
+| `RleBitmap.cs` | The bitmap RLE form (MS-RDPBCGR 2.2.2.1) |
+| `BulkDecompressor.cs` | The RDP 6.0 bulk-compressed stream |
+| `OrderDecoder.cs` | MS-RDPEGDI drawing orders, walked field by field against a `SpanReader` |
+| `ScreenSurface.cs` | In-memory desktop: fill, copy, cached-bitmap blit, `ToBmp` |
+
+`OrderDecoder` is the one that does not yet work — see "The order stream from
+xrdp does not decode yet" in AGENTS.md. It is also the one whose failures are
+hardest to see: a decoder one octet out of step keeps producing plausible order
+names, and `OrdersRendered` can rise for several hundred orders before the stream
+drifts. So it also reports `OrdersInLastUpdate` and `BytesLeftAfterLastUpdate`,
+and the two checks that actually catch a desync are whether the decoded count
+equals `numberOrders` on the wire and whether the last order's type is one
+MS-RDPEGDI defines.
+
 ## Design decisions worth knowing
 
 **Stop at a protocol boundary rather than guess.** When the server selects
@@ -128,8 +159,16 @@ they run offline in under a second.
 
 ## Not implemented, by design
 
-The capability exchange, security negotiation, graphics pipeline and input
-stack are absent. Each is a substantial subsystem: the graphics pipeline alone
-needs a virtual desktop, bitmap codecs, and an RDP 6.x decompressor. Stopping
-at the handshake boundary is more useful than a half-built renderer, and the
-stopping point is reported accurately rather than hidden.
+The RSA key exchange and session-key derivation (MS-RDPBCGR 5.3.2), encryption
+of the MCS traffic, and the whole input stack are absent. `Security/Rc4.cs`
+exists for the NTLM session key and nothing wires it into the connection yet.
+Each of these is a substantial subsystem, and stopping before one is more useful
+than half-building it — the stopping point is reported accurately rather than
+hidden.
+
+Two things that used to be listed here are implemented now: the capability
+exchange and connection finalization, both verified against xrdp. The graphics
+pipeline is implemented too, but it does not produce a picture — updates are
+read and composited into a `ScreenSurface`, while the drawing orders xrdp sends
+do not decode. That is recorded as a failure with its measurements in AGENTS.md
+rather than as progress.

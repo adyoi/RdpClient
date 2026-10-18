@@ -46,7 +46,7 @@ exists for IntelliSense; everything non-obvious is documented at the member.
 | RDP negotiation | 2.2.1.1.1, 2.2.1.2.1 | Verified |
 | TLS handshake | MS-RDPEA 3.1.5.1 | Verified, TLS 1.2 and 1.3 |
 | CredSSP `TSRequest` envelope | MS-CSSP 2.2.1 | **Encoded and verified structurally**; host now parses it |
-| SPNEGO + NTLM | MS-NLMP | **Not working**, host returns `SEC_E_INVALID_TOKEN` |
+| SPNEGO + NTLM | MS-NLMP | **Not working**. The envelope, flags, MIC and session key are now correct enough that the host no longer rejects the token: the failure moved from `SEC_E_INVALID_TOKEN` to `STATUS_LOGON_FAILURE`, which is the credential check, not the signature check |
 | MCS Connect Initial / Response | 2.2.1.3, 2.2.1.4 | **Verified against xrdp** |
 | GCC client data (`TS_UD_CS_*`) | 2.2.1.3 | **Verified against xrdp**; the blocks are accepted |
 | Erect Domain / Attach User / Channel Join | 2.2.1.5, 2.2.1.6, 2.2.1.8 | **Verified against xrdp**, and the Confirms are read |
@@ -54,16 +54,22 @@ exists for IntelliSense; everything non-obvious is documented at the member.
 | Client Info PDU, licensing skip | 1.3.1.1, 2.2.1.11 | **Verified against xrdp**; the Licensing PDU it triggers is skipped by structure |
 | Capability exchange | 2.2.7, 2.2.1.13 | **Verified against xrdp**: the Demand Active arrives and parses, the Confirm Active is answered without a server error |
 | Synchronize / Control / Font List | 2.2.1.14-2.2.1.18 | **Verified against xrdp**: the server's Synchronize, Control (Cooperate and Granted Control) and Font Map PDUs all arrive and parse |
-| Graphics update, pointer and input | 2.2.9, 2.2.8 | Not started |
+| Graphics: reading updates, bitmap path | 2.2.9.1.1.3 | **Read and dispatched, not verified.** Every update body reaches the decoder and `--dump-graphics` captures it. The captures taken so far hold only an Orders Update and a Synchronize Update, so the bitmap path has never been exercised by a live server, and no rendered surface has ever been written to disk |
+| Graphics: drawing orders | MS-RDPEGDI 2.2.2.2.1 | **Implemented, does not decode xrdp's stream.** See [The order stream from xrdp does not decode yet](#the-order-stream-from-xrdp-does-not-decode-yet) |
+| Pointer and input | 2.2.8, 2.2.9.2 | Not started |
 
 Do not describe this as a working remote desktop client. It reaches TLS and
 authenticates nothing. Against xrdp it now completes the whole connection
 sequence: the client sends the Client Info PDU, reads the Licensing and Demand
 Active PDUs, answers with a Confirm Active xrdp accepts, then sends the
 Synchronize, Control (Cooperate and Request Control) and Font List PDUs as one
-batch and reads the server's Synchronize, Control and Font Map replies. The
-session still shows no desktop: every graphics, pointer and input PDU is
-unimplemented, so the server's output has nowhere to go.
+batch and reads the server's Synchronize, Control and Font Map replies.
+
+Graphics PDUs are then read and dispatched rather than ignored, but the session
+still shows no desktop: xrdp's drawing order stream does not decode, so nothing
+reaches the surface. Pointer and input PDUs are unimplemented, so nothing could
+be sent back either. What a run looks like today is
+`RESULT: connection finalised; 1 graphics update(s) read, 0 applied.`
 
 ### Connection finalization goes out as one batch, not one read at a time
 
@@ -404,6 +410,87 @@ Read that log before forming a theory, exactly as the Windows event log is read
 above. [docs/wsl-rdp-lab.md](docs/wsl-rdp-lab.md) is the full setup, including
 the desktop choices and the idle-shutdown trap.
 
+## The order stream from xrdp does not decode yet
+
+The graphics phase is reached and every Orders Update body is read, but the
+decoder cannot walk xrdp's order stream. This is written down because the
+failure is unusually easy to hide: a decoder that is one octet out of step keeps
+naming plausible-looking orders for as long as the bytes ahead of it happen to
+decode. The only reliable signals are an order type outside the range
+MS-RDPEGDI defines, or a count of decoded orders that does not match the count
+on the wire. Both appeared here, and neither was visible without tracing.
+
+### Capture the body; do not log it
+
+`--dump-graphics <path>` appends every graphics update body to a file as a
+four-octet little-endian length followed by the body. `--hex` is not a
+substitute: `Hex()` puts a newline after every sixteen octets and the logger
+keeps the first line, so a 639-octet orders update was being logged as its
+first sixteen octets - exactly the part that was already understood. Then read
+the file rather than reasoning about it:
+
+```powershell
+$b = [System.IO.File]::ReadAllBytes("$env:TEMP\gfx.bin")
+$off = 0; $recs = @()
+while ($off -lt $b.Length) {
+  $len = [BitConverter]::ToInt32($b, $off); $off += 4
+  $recs += ,($b[$off..($off+$len-1)]); $off += $len
+}
+$body = $recs[1]
+for ($i = 0; $i -lt $body.Length; $i += 16) {
+  "{0:x4}: {1}" -f $i, (($body[$i..([Math]::Min($i+15,$body.Length-1))] |
+    ForEach-Object { $_.ToString("x2") }) -join " ")
+}
+```
+
+Note that the length prefix is at offset 0 of the **file**, not of the first
+record; starting the walk at offset 4 reads the first record's body as if it
+were a length and quietly shifts every later offset by four.
+
+### What the capture says
+
+Measured from one 639-octet Orders Update sent by xrdp:
+
+| Fact | Value |
+| --- | --- |
+| `updateType` | `0x0000`, an Orders Update |
+| `numberOrders` (offset 4) | **193** |
+| order data (639 - 8) | 631 octets |
+| first order | secondary Cache Bitmap - Revision 2: `controlFlags` `0x03`, `orderType` `0x05` |
+| its `extraFlags` | `0x042a`, which decodes as cacheId **2**, bitsPerPixelId **5** (24 bpp), flags **0x008** = `CBR2_NO_BITMAP_COMPRESSION_HDR` |
+| its `orderLength` on the wire | `0x0004`, so the header's own figure says **17** octets |
+| where the next order actually starts | offset `0x4E`, so **70** octets |
+| what follows | eleven tiles of exactly **51** octets, and 70 + 11 x 51 = 631, the whole order data |
+
+Each 51-octet tile is a six-octet primary order (`41 06` and four octets of
+two present fields) followed by fifteen three-octet orders (`51 02 40` - one
+flag octet and one delta coordinate). That part of the primary path parses
+correctly and is why the per-order trace looked plausible for so long.
+
+### The four numbers do not reconcile
+
+| Reading | Value |
+| --- | ---: |
+| `numberOrders` from the header | 193 |
+| orders the 70 + 11 x 51 layout explains | 1 + 11 x 16 = **177** |
+| first order's length per `orderLength` | 17 octets |
+| first order's length per where the next one starts | 70 octets |
+
+MS-RDPEGDI 2.2.2.2.1.2.1.1 says `orderLength` "MUST be 13 bytes less than the
+actual order length", and 4 + 13 = 17 does not match 70. **Settle which field
+gives a Cache Bitmap's true length against this capture before changing
+`OrderDecoder.DecodeOne`.** The candidate is `bitmapLength`
+(MS-RDPEGDI 2.2.2.2.1.2.3), but it is a Four-Byte Unsigned Encoding sitting
+after `bitmapWidth` and `bitmapHeight` (Two-Byte Unsigned Encodings) and before
+`cacheIndex`, with `key1`/`key2` inserted when `CBR2_PERSISTENT_KEY_PRESENT`
+is set - so its offset is a function of four other fields and is not something
+to place from memory. One earlier attempt did exactly that, guessed the offset
+for revision 2, and changed nothing.
+
+Nothing else in this file should be trusted to fix it: this is the one place
+where the specification, the capture and a running server have to agree before
+the code is touched.
+
 ## Verifying a wire-format change
 
 The single most useful thing in this project. Do not reason about bytes from
@@ -537,6 +624,12 @@ wrong. The NTLM NEGOTIATE is not the reason the host rejects the token.
   obvious choice is wrong.
 - Never log or commit credentials. `rdpprobe` reads the password from
   `RDP_PASSWORD` and must never echo it.
+- **A commit message describes the tree, not the intent.** A `git checkout --`
+  run to drop one speculative helper also discarded two verified fixes that had
+  not been staged, and the commit that followed described those fixes because
+  that is what had been written down, not because they were in it. The next
+  reader then trusts a message that the code does not honour. Confirm the
+  claimed lines are present in `git show HEAD:<path>` before pushing.
 - When something does not work, say so and say why. This project reports a
   failure with its cause rather than claiming partial success.
 
