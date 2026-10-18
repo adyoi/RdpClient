@@ -76,6 +76,154 @@ public sealed class ScreenSurface
         return painted;
     }
 
+    /// <summary>Fill one rectangle with a colour, clipping it to the surface.</summary>
+    /// <remarks>
+    /// A negative or zero extent is dropped rather than clamped: the server
+    /// states the width it means, and a rectangle that arrives empty is a
+    /// drawing operation that covers nothing, not one that should be guessed at.
+    /// </remarks>
+    public void FillRect(int left, int top, int width, int height, byte r, byte g, byte b)
+    {
+        if (width <= 0 || height <= 0)
+        {
+            return;
+        }
+
+        for (int y = 0; y < height; y++)
+        {
+            int targetY = top + y;
+            if (targetY < 0 || targetY >= Height)
+            {
+                continue;
+            }
+
+            for (int x = 0; x < width; x++)
+            {
+                int targetX = left + x;
+                if (targetX < 0 || targetX >= Width)
+                {
+                    continue;
+                }
+
+                int offset = ((targetY * Width) + targetX) * 4;
+                _pixels[offset] = b;
+                _pixels[offset + 1] = g;
+                _pixels[offset + 2] = r;
+                _pixels[offset + 3] = 0xFF;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Copy a rectangle of the surface onto itself, overlapping or not.
+    /// </summary>
+    /// <remarks>
+    /// Copied a scanline at a time rather than a pixel at a time, and the source
+    /// scanline is read into a temporary first: a self-overlapping copy done in
+    /// place smears, which is exactly what a ScrBlt whose regions overlap
+    /// should not do.
+    /// </remarks>
+    public void CopyRect(int sourceLeft, int sourceTop, int destLeft, int destTop, int width, int height)
+    {
+        if (width <= 0 || height <= 0)
+        {
+            return;
+        }
+
+        var scanline = new byte[width * 4];
+
+        for (int y = 0; y < height; y++)
+        {
+            int sourceY = sourceTop + y;
+            int destY = destTop + y;
+            if (sourceY < 0 || sourceY >= Height || destY < 0 || destY >= Height)
+            {
+                continue;
+            }
+
+            int copied = 0;
+            for (int x = 0; x < width; x++)
+            {
+                int sourceX = sourceLeft + x;
+                if (sourceX < 0 || sourceX >= Width)
+                {
+                    continue;
+                }
+
+                _pixels.AsSpan(((sourceY * Width) + sourceX) * 4, 4)
+                    .CopyTo(scanline.AsSpan(copied * 4));
+                copied++;
+            }
+
+            if (copied == 0)
+            {
+                continue;
+            }
+
+            for (int x = 0; x < copied; x++)
+            {
+                int destX = destLeft + x;
+                if (destX < 0 || destX >= Width)
+                {
+                    continue;
+                }
+
+                scanline.AsSpan(x * 4, 4).CopyTo(_pixels.AsSpan(((destY * Width) + destX) * 4));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Draw a cached 16 bpp bitmap at a position.
+    /// </summary>
+    /// <remarks>
+    /// The bitmap's own width governs the copy, not the width the order asked
+    /// for: an order's rectangle is the region it affects, and a cache entry
+    /// that is narrower than that must not read past its own row.
+    /// </remarks>
+    public void BlitCachedBitmap(
+        ReadOnlySpan<byte> pixels, int bitmapWidth, int bitmapHeight, int rowBytes, int left, int top)
+    {
+        if (bitmapWidth <= 0 || bitmapHeight <= 0 || rowBytes <= 0)
+        {
+            return;
+        }
+
+        for (int y = 0; y < bitmapHeight; y++)
+        {
+            int targetY = top + y;
+            if (targetY < 0 || targetY >= Height)
+            {
+                continue;
+            }
+
+            int sourceRow = y * rowBytes;
+
+            for (int x = 0; x < bitmapWidth; x++)
+            {
+                int targetX = left + x;
+                if (targetX < 0 || targetX >= Width)
+                {
+                    continue;
+                }
+
+                int source = sourceRow + (x * 2);
+                if (source + 1 >= pixels.Length)
+                {
+                    break;
+                }
+
+                int value = pixels[source] | (pixels[source + 1] << 8);
+                int destination = ((targetY * Width) + targetX) * 4;
+
+                _pixels[destination] = (byte)((((value >> 0) & 0x1F) << 3) | (((value >> 0) & 0x1F) >> 2));
+                _pixels[destination + 1] = (byte)((((value >> 5) & 0x3F) << 2) | (((value >> 5) & 0x3F) >> 4));
+                _pixels[destination + 2] = (byte)((((value >> 11) & 0x1F) << 3) | (((value >> 11) & 0x1F) >> 2));
+                _pixels[destination + 3] = 0xFF;
+            }
+        }
+    }
+
     /// <summary>Fill the whole surface with one colour, as a black desktop starts.</summary>
     public void Clear(byte r, byte g, byte b)
     {

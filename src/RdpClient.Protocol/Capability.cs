@@ -54,6 +54,33 @@ public static class Capability
     /// <summary>CAPSTYPE_FONT, from MS-RDPBCGR 2.2.7.2.5.</summary>
     public const ushort CapSetFont = Rdp.CapSetFont;
 
+    /// <summary>CAPSTYPE_BITMAPCACHE_REV2, from MS-RDPBCGR 2.2.7.1.4.2.</summary>
+    public const ushort CapSetBitmapCacheRev2 = Rdp.CapSetBmpCacheRev2;
+
+    /// <summary>
+    /// TS_BITMAPCACHE_CAPABILITYSET_REV2 is 40 octets: the two header octets
+    /// pairs, CacheFlags, Pad2, NumCellCaches, five four-octet cell infos and
+    /// the twelve-octet Pad3 (2.2.7.1.4.2).
+    /// </summary>
+    public const int BitmapCacheRev2CapabilitySetLength = 40;
+
+    /// <summary>The three cell caches this client advertises (2.2.7.1.4.2).</summary>
+    public const byte BitmapCacheCellCount = 3;
+
+    /// <summary>
+    /// Cell counts for caches 0, 1 and 2, from the values Microsoft's own
+    /// protocol test suite uses (2.2.7.1.4.2, <c>BITMAP_CACHE_CELL1_VALUE</c>
+    /// and friends).
+    /// </summary>
+    public static readonly ushort[] BitmapCacheEntries = [120, 120, 2555];
+
+    /// <summary>
+    /// Per-cache maximum cell sizes. Cache 0 holds bitmaps of about 16 KiB,
+    /// cache 1 about 64 KiB, and cache 2 about 256 KiB, which is the ladder the
+    /// test suite advertises and which xrdp's own default matches.
+    /// </summary>
+    public static readonly int[] BitmapCacheMaxCellSize = [16 * 1024, 64 * 1024, 256 * 1024];
+
     /// <summary>TS_BITMAP_CAPABILITYSET is a fixed 28 octets.</summary>
     public const int BitmapCapabilitySetLength = 28;
 
@@ -291,6 +318,72 @@ public static class Capability
     }
 
     /// <summary>
+    /// Build the Revision 2 Bitmap Cache Capability Set (MS-RDPBCGR 2.2.7.1.4.2).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Without this set the server has nowhere to put a bitmap: xrdp answers
+    /// every Cache Bitmap order with <c>error in xrdp_cache_add_bitmap, too
+    /// big</c> and repeats it for each one, so nothing reaches the screen even
+    /// though the orders themselves decode.
+    /// </para>
+    /// <para>
+    /// A <c>TS_BITMAPCACHE_CELL_CACHE_INFO</c> packs two nibbles and two
+    /// octets: the low seven bits of the first octet are the number of cells,
+    /// its high bit is the wait flag, and the second octet holds two more
+    /// nibbles for the per-cell maximum size. That packing is why the cell
+    /// counts below are masked with 0x7F rather than written plainly.
+    /// </para>
+    /// </remarks>
+    public static byte[] BuildBitmapCacheRev2CapabilitySet()
+    {
+        var w = new ByteWriter(BitmapCacheRev2CapabilitySetLength);
+        w.U16(CapSetBitmapCacheRev2);
+        w.U16(BitmapCacheRev2CapabilitySetLength);
+        w.U16(0);                              // CacheFlags
+        w.U8(0);                               // Pad2
+        w.U8(BitmapCacheCellCount);             // NumCellCaches
+
+        for (int cache = 0; cache < 5; cache++)
+        {
+            if (cache < BitmapCacheCellCount)
+            {
+                w.U32(BuildCellCacheInfo(BitmapCacheEntries[cache], BitmapCacheMaxCellSize[cache]));
+            }
+            else
+            {
+                w.U32(0);
+            }
+        }
+
+        // Pad3, twelve octets, which the variable-length writer leaves as zeros.
+        for (int i = 0; i < 12; i++)
+        {
+            w.U8(0);
+        }
+
+        return w.ToArray();
+    }
+
+    /// <summary>
+    /// Pack one <c>TS_BITMAPCACHE_CELL_CACHE_INFO</c> (2.2.7.1.4.2.1).
+    /// </summary>
+    private static uint BuildCellCacheInfo(ushort entries, int maximumCellSize)
+    {
+        // The size is expressed in units that double as the cell grows, so it is
+        // stored as the logarithm: 16 KiB is 2^10, and the specification's table
+        // starts at 240 which is 15 * 16.
+        int sizeUnits = maximumCellSize <= 240
+            ? maximumCellSize / 16
+            : maximumCellSize >> 8;
+
+        uint low = (uint)(entries & 0x7F);
+        uint high = (uint)(sizeUnits & 0x0F) << 4;
+
+        return low | high | ((uint)(sizeUnits >> 4) << 16);
+    }
+
+    /// <summary>
     /// Build the Font Capability Set (MS-RDPBCGR 2.2.7.2.5).
     /// </summary>
     /// <remarks>
@@ -430,12 +523,18 @@ public static class Capability
         Rdp.CapSetGlyphCache => "GlyphCache",
         Rdp.CapSetOffscreenCache => "OffscreenCache",
         Rdp.CapSetBmpCacheRev2 => "BmpCacheRev2",
+        Rdp.CapSetBmpCacheHostSupport => "BmpCacheHostSupport",
         Rdp.CapSetVirtualChannel => "VirtualChannel",
-        Rdp.CapSetDrawableGdi => "DrawableGdi",
-        Rdp.CapSetPduOrder => "PduOrder",
-        Rdp.CapSetTextInput => "TextInput",
+        Rdp.CapSetDrawNineGridCache => "DrawNineGridCache",
+        Rdp.CapSetDrawGdiPlus => "DrawGdiPlus",
+        Rdp.CapSetRail => "Rail",
         Rdp.CapSetWindow => "Window",
+        Rdp.CapSetCompDesk => "CompDesk",
         Rdp.CapSetMultitransport => "Multitransport",
+        Rdp.CapSetLargePointer => "LargePointer",
+        Rdp.CapSetSurfaceCommands => "SurfaceCommands",
+        Rdp.CapSetBitmapCodecs => "BitmapCodecs",
+        Rdp.CapSetFrameAcknowledge => "FrameAcknowledge",
         _ => "Unknown",
     };
 

@@ -497,6 +497,7 @@ public sealed class RdpConnection : IAsyncDisposable
                 [
                     Capability.BuildGeneralCapabilitySet(),
                     Capability.BuildBitmapCapabilitySet(desktopWidth, desktopHeight, colourDepth),
+                    Capability.BuildBitmapCacheRev2CapabilitySet(),
                     Capability.BuildFontCapabilitySet(),
                 ]);
             await SendOnGlobalChannelAsync(assigned, confirmActive, cancellationToken).ConfigureAwait(false);
@@ -900,6 +901,7 @@ public sealed class RdpConnection : IAsyncDisposable
 
         var surface = new ScreenSurface(DesktopWidth, DesktopHeight);
         surface.Clear(0, 0, 0);
+        var orders = new OrderDecoder(surface);
 
         while (GraphicsUpdatesApplied < limit)
         {
@@ -945,8 +947,10 @@ public sealed class RdpConnection : IAsyncDisposable
                         $"  UPDATE body ({body.Length} bytes) {Hex(body)}");
                 }
 
+                int ordersBefore = orders.OrdersDecoded;
+
                 IReadOnlyList<BitmapUpdate.BitmapRectangle> rectangles =
-                    BitmapUpdate.ParseUpdate(body, ColourDepth);
+                    BitmapUpdate.ParseUpdate(body, ColourDepth, orders);
 
                 int painted = 0;
                 foreach (BitmapUpdate.BitmapRectangle rectangle in rectangles)
@@ -954,11 +958,18 @@ public sealed class RdpConnection : IAsyncDisposable
                     painted += surface.Paint(rectangle);
                 }
 
-                if (painted > 0)
+                // The progress test counts orders decoded, not orders rendered: an update
+                // made entirely of cache-populating secondary orders paints
+                // nothing yet and still has to count, or a session whose first
+                // PDUs are all cache fills never advances.
+                int ordersDecoded = orders.OrdersDecoded - ordersBefore;
+
+                if (painted > 0 || ordersDecoded > 0)
                 {
                     GraphicsUpdatesApplied++;
-                    Report(HandshakeStage.Complete,
-                        $"painted {painted} pixel(s) from {rectangles.Count} rectangle(s)");
+                    Report(HandshakeStage.Complete, painted > 0
+                        ? $"painted {painted} pixel(s) from {rectangles.Count} bitmap rectangle(s)"
+                        : $"executed {ordersDecoded} drawing order(s), last {orders.LastOrder}");
                     OnSurfaceUpdated?.Invoke(surface);
                 }
             }
@@ -979,7 +990,7 @@ public sealed class RdpConnection : IAsyncDisposable
                 // parse bug in one of the decoders rather than a protocol fault,
                 // so it is reported with the parameter name that failed.
                 Report(HandshakeStage.Complete,
-                    $"graphics decode failed on '{ex.ParamName}': {ex.Message} {ex.StackTrace}",
+                    $"graphics decode failed on '{ex.ParamName}': {ex.Message}",
                     isError: true);
             }
         }

@@ -73,12 +73,16 @@ public static class BitmapUpdate
     /// The colour depth the client advertised, which selects the pixel format
     /// the server is expected to use.
     /// </param>
+    /// <param name="orders">
+    /// The decoder that renders GDI drawing orders, or null to report them as
+    /// unimplemented instead.
+    /// </param>
     /// <exception cref="NotSupportedException">
     /// The update is a type this client does not render, which is a reportable
     /// limitation rather than a parse failure.
     /// </exception>
     public static IReadOnlyList<BitmapRectangle> ParseUpdate(
-        byte[] body, int requestedDepth)
+        byte[] body, int requestedDepth, OrderDecoder? orders = null)
     {
         ArgumentNullException.ThrowIfNull(body);
 
@@ -101,11 +105,17 @@ public static class BitmapUpdate
                 // xrdp sends orders regardless of what the client advertised:
                 // its gdi/xrdp layer picks orders by server policy, not by the
                 // client's capability set. That is a fact about xrdp, not a
-                // misconfiguration to correct on the client, so the message
-                // says so rather than telling the caller to change the set.
-                throw new NotSupportedException(
-                    "the server sent GDI drawing orders (MS-RDPEGDI), which this client does "
-                    + "not implement; only bitmap updates are decoded");
+                // misconfiguration to correct on the client, so the orders are
+                // executed against the caller's decoder rather than refused.
+                if (orders is null)
+                {
+                    throw new NotSupportedException(
+                        "the server sent GDI drawing orders (MS-RDPEGDI) but no order decoder "
+                        + "was supplied to render them");
+                }
+
+                orders.ExecuteOrdersUpdate(body);
+                return [];
 
             case UpdateTypePalette:
                 throw new NotSupportedException(

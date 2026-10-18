@@ -242,13 +242,19 @@ public static class Rdp
     public const ushort CapSetBrush = 0x000f;
     public const ushort CapSetGlyphCache = 0x0010;
     public const ushort CapSetOffscreenCache = 0x0011;
-    public const ushort CapSetBmpCacheRev2 = 0x0012;
-    public const ushort CapSetVirtualChannel = 0x0013;
-    public const ushort CapSetDrawableGdi = 0x0014;
-    public const ushort CapSetPduOrder = 0x0015;
-    public const ushort CapSetTextInput = 0x0016;
-    public const ushort CapSetWindow = 0x0017;
+    public const ushort CapSetBmpCacheHostSupport = 0x0012;
+    public const ushort CapSetBmpCacheRev2 = 0x0013;
+    public const ushort CapSetVirtualChannel = 0x0014;
+    public const ushort CapSetDrawNineGridCache = 0x0015;
+    public const ushort CapSetDrawGdiPlus = 0x0016;
+    public const ushort CapSetRail = 0x0017;
+    public const ushort CapSetWindow = 0x0018;
+    public const ushort CapSetCompDesk = 0x0019;
     public const ushort CapSetMultitransport = 0x001a;
+    public const ushort CapSetLargePointer = 0x001b;
+    public const ushort CapSetSurfaceCommands = 0x001c;
+    public const ushort CapSetBitmapCodecs = 0x001d;
+    public const ushort CapSetFrameAcknowledge = 0x001e;
 
     // --- Virtual channel identifiers (MS-RDPBCGR 2.2.1.3.4.1) ------------
 
