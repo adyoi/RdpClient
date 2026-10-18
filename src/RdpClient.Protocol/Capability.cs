@@ -48,6 +48,21 @@ public static class Capability
     /// <summary>CAPSTYPE_GENERAL, from MS-RDPBCGR 2.2.7.1.1.</summary>
     public const ushort CapSetGeneral = Rdp.CapSetGeneral;
 
+    /// <summary>CAPSTYPE_BITMAP, from MS-RDPBCGR 2.2.7.1.2.</summary>
+    public const ushort CapSetBitmap = Rdp.CapSetBitmap;
+
+    /// <summary>CAPSTYPE_FONT, from MS-RDPBCGR 2.2.7.2.5.</summary>
+    public const ushort CapSetFont = Rdp.CapSetFont;
+
+    /// <summary>TS_BITMAP_CAPABILITYSET is a fixed 28 octets.</summary>
+    public const int BitmapCapabilitySetLength = 28;
+
+    /// <summary>TS_FONT_CAPABILITYSET is a fixed 8 octets.</summary>
+    public const int FontCapabilitySetLength = 8;
+
+    /// <summary>DRAW_UNUSED_FLAG, which MS-RDPBCGR 2.2.7.1.2 says to ignore.</summary>
+    public const byte DrawingFlagUnused = 0x10;
+
     /// <summary>TS_CAPS_PROTOCOLVERSION, from MS-RDPBCGR 2.2.7.1.1.</summary>
     public const ushort CapsProtocolVersion = 0x0200;
 
@@ -205,6 +220,92 @@ public static class Capability
         w.U16(0);         // compressionLevel, must be zero
         w.U8(0);          // refreshRectSupport, server-only
         w.U8(0);          // suppressOutputSupport, server-only
+        return w.ToArray();
+    }
+
+    /// <summary>
+    /// Build the Bitmap Capability Set (MS-RDPBCGR 2.2.7.1.2).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Sending this set is what makes the server send bitmap updates
+    /// (2.2.9.1.1.3.1.2) rather than GDI drawing orders, because the Order
+    /// Capability Set is what asks for orders and this client deliberately does
+    /// not send it - the order vocabulary in [MS-RDPEGDI] is not implemented.
+    /// </para>
+    /// <para>
+    /// Two fields are not free choices. <c>bitmapCompressionFlag</c> and
+    /// <c>multipleRectangleSupport</c> MUST both be 1 "because multiple
+    /// rectangle support is required for a connection to proceed", so a client
+    /// that cannot decompress interleaved RLE or handle several rectangles per
+    /// update cannot claim this set at all - it would be lying about what it can
+    /// accept.
+    /// </para>
+    /// <para>
+    /// The <c>receive{1,4,8}BitsPerPixel</c> fields are documented as ignored
+    /// but SHOULD be TRUE, so they are written as 1 rather than 0.
+    /// </para>
+    /// </remarks>
+    /// <param name="desktopWidth">The requested desktop width in pixels.</param>
+    /// <param name="desktopHeight">The requested desktop height in pixels.</param>
+    /// <param name="preferredBitsPerPixel">
+    /// The colour depth requested, which must match what the client can decode.
+    /// </param>
+    public static byte[] BuildBitmapCapabilitySet(
+        int desktopWidth, int desktopHeight, int preferredBitsPerPixel = 16)
+    {
+        if (desktopWidth is < 1 or > ushort.MaxValue)
+        {
+            throw new ArgumentOutOfRangeException(nameof(desktopWidth));
+        }
+
+        if (desktopHeight is < 1 or > ushort.MaxValue)
+        {
+            throw new ArgumentOutOfRangeException(nameof(desktopHeight));
+        }
+
+        if (preferredBitsPerPixel is not (15 or 16 or 24 or 32))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(preferredBitsPerPixel), preferredBitsPerPixel,
+                "the Bitmap Capability Set carries 15, 16, 24 or 32");
+        }
+
+        var w = new ByteWriter(BitmapCapabilitySetLength);
+        w.U16(CapSetBitmap);
+        w.U16(BitmapCapabilitySetLength);
+        w.U16(preferredBitsPerPixel);
+        w.U16(1);          // receive1BitPerPixel, ignored but SHOULD be TRUE
+        w.U16(1);          // receive4BitsPerPixel
+        w.U16(1);          // receive8BitsPerPixel
+        w.U16(desktopWidth);
+        w.U16(desktopHeight);
+        w.U16(0);          // pad2octets
+        w.U16(0);          // desktopResizeFlag: this client does not resize
+        w.U16(1);          // bitmapCompressionFlag: MUST be TRUE to proceed
+        w.U8(0);           // highColorFlags: ignored, SHOULD be zero
+        w.U8(DrawingFlagUnused);    // drawingFlags; the bit is documented as ignored
+        w.U16(1);          // multipleRectangleSupport: MUST be TRUE to proceed
+        w.U16(0);          // pad2octetsB
+        return w.ToArray();
+    }
+
+    /// <summary>
+    /// Build the Font Capability Set (MS-RDPBCGR 2.2.7.2.5).
+    /// </summary>
+    /// <remarks>
+    /// This client renders no text, so it advertises no fonts and no font
+    /// smoothing. It is sent because the Font List PDU has already gone out and
+    /// the server answers it with a Font Map regardless; announcing no fonts is
+    /// what an empty <c>fontList</c> in that PDU means.
+    /// </remarks>
+    public static byte[] BuildFontCapabilitySet()
+    {
+        var w = new ByteWriter(FontCapabilitySetLength);
+        w.U16(CapSetFont);
+        w.U16(FontCapabilitySetLength);
+        w.U16(0);          // fontSupportFlags
+        w.U16(0);          // pad2Octets
         return w.ToArray();
     }
 

@@ -91,6 +91,32 @@ internal static class Program
             connectionOptions = connectionOptions with { Security = SecurityModeSelection.TlsOnly };
         }
 
+        if (options.TryGetValue("graphics", out string? graphicsText)
+            && int.TryParse(graphicsText, out int graphics))
+        {
+            connectionOptions = connectionOptions with { GraphicsPduLimit = graphics };
+        }
+
+        if (options.TryGetValue("width", out string? widthText)
+            && int.TryParse(widthText, out int width))
+        {
+            connectionOptions = connectionOptions with { DesktopWidth = width };
+        }
+
+        if (options.TryGetValue("height", out string? heightText)
+            && int.TryParse(heightText, out int height))
+        {
+            connectionOptions = connectionOptions with { DesktopHeight = height };
+        }
+
+        if (options.TryGetValue("depth", out string? depthText)
+            && int.TryParse(depthText, out int depth))
+        {
+            connectionOptions = connectionOptions with { ColourDepth = depth };
+        }
+
+        string? bmpPath = Get(options, "dump-bmp");
+
         if (options.ContainsKey("classic-user"))
         {
             // Off by default: the block puts the password on the wire in the
@@ -116,10 +142,20 @@ internal static class Program
         Console.WriteLine();
         if (stage == HandshakeStage.Complete)
         {
-            Console.WriteLine("RESULT: connection finalised through the capability and "
-                          + "Synchronize/Control/Font List exchanges.");
-            Console.WriteLine("        Graphics and input are not implemented, so no "
-                              + "desktop will be displayed.");
+            if (connection.Surface is { } surface && bmpPath is not null)
+            {
+                // Written rather than displayed: the probe has no UI, and a BMP
+                // is the one image format that needs no encoder, so what the
+                // decoder produced can be looked at directly.
+                await File.WriteAllBytesAsync(bmpPath, surface.ToBmp(), cts.Token);
+                Console.WriteLine($"wrote a {surface.Width}x{surface.Height} surface to {bmpPath}");
+            }
+
+            Console.WriteLine(
+                $"RESULT: connection finalised; {connection.GraphicsUpdatesApplied} "
+                + "graphics update(s) applied.");
+            Console.WriteLine("        Input is not implemented, so the session is "
+                              + "not interactive.");
             return 0;
         }
 
@@ -185,6 +221,15 @@ internal static class Program
               --skip-channel-join
                          announce RNS_UD_CS_SUPPORT_SKIP_CHANNELJOIN and
                          send no Channel Join Requests. Unverified against xrdp.
+              --graphics <n>
+                         after the connection is finalised, read and paint up to
+                         <n> graphics update PDUs, then stop
+              --width <px> --height <px>
+                         desktop size requested in the Bitmap Capability Set,
+                         default 1024x768
+              --depth <bpp>  colour depth requested, 16 or 32, default 16
+              --dump-bmp <path>
+                         write the composited desktop to a BMP on completion
               --tls12     restrict TLS to 1.2 instead of 1.2/1.3
               --tls-only  require PROTOCOL_SSL (TLS only, no SPNEGO)
               --credssp-only

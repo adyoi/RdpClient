@@ -151,8 +151,34 @@ public static class ConnectionFinalisation
     }
 
     /// <summary>
-    /// A parsed Share Data PDU: its two headers and the PDU body.
+    /// A parsed Share Data PDU: its two headers, the PDU body, and the raw
+    /// octets it was parsed from.
     /// </summary>
+    /// <param name="TotalLength">
+    /// The Share Control Header's <c>totalLength</c>, which counts both headers
+    /// and the body.
+    /// </param>
+    /// <param name="PduType">The low nibble of the control header's pduType.</param>
+    /// <param name="PduSource">The channel the PDU is sent on.</param>
+    /// <param name="ShareId">The share id from the Demand Active PDU.</param>
+    /// <param name="StreamId">The T.128 stream id.</param>
+    /// <param name="UncompressedLength">The length of the PDU once inflated.</param>
+    /// <param name="PduType2">The type of the PDU carried in the body.</param>
+    /// <param name="Action">
+    /// The first body field, which is the <c>messageType</c> of a Synchronize
+    /// PDU and the <c>action</c> of a Control PDU.
+    /// </param>
+    /// <param name="BodyOffset">Where the body begins, past both headers.</param>
+    /// <param name="CompressedType">
+    /// The Share Data Header's <c>compressedType</c>: the low nibble is the
+    /// compression package, and 0x20, 0x40 and 0x80 are the PACKET_COMPRESSED,
+    /// PACKET_AT_FRONT and PACKET_FLUSHED flags.
+    /// </param>
+    /// <param name="CompressedLength">
+    /// The Share Data Header's <c>compressedLength</c>: zero when the body is not
+    /// compressed, otherwise the size of the compressed payload.
+    /// </param>
+    /// <param name="RawPdu">The octets the PDU was parsed from.</param>
     public sealed record ShareDataPduInfo(
         int TotalLength,
         int PduType,
@@ -162,7 +188,10 @@ public static class ConnectionFinalisation
         ushort UncompressedLength,
         byte PduType2,
         ushort Action,
-        int BodyOffset);
+        int BodyOffset,
+        byte CompressedType,
+        ushort CompressedLength,
+        byte[] RawPdu);
 
     /// <summary>
     /// Parse the two headers of a received Share Data PDU.
@@ -192,8 +221,8 @@ public static class ConnectionFinalisation
         byte streamId = r.U8();
         ushort uncompressedLength = r.U16();
         byte pduType2 = r.U8();
-        r.U8();                            // compressedType
-        r.U16();                           // compressedLength
+        byte compressedType = r.U8();
+        ushort compressedLength = r.U16();
 
         int bodyOffset = 6 + ShareDataHeaderSize;
         // The first body field is the messageType of a Synchronize PDU and the
@@ -201,7 +230,8 @@ public static class ConnectionFinalisation
         ushort action = r.Remaining >= 2 ? r.U16() : (ushort)0;
 
         return new ShareDataPduInfo(totalLength, pduType, pduSource, shareId, streamId,
-            uncompressedLength, pduType2, action, bodyOffset);
+            uncompressedLength, pduType2, action, bodyOffset,
+            compressedType, compressedLength, buffer);
     }
 
     /// <summary>Name a client PDU for the handshake log.</summary>
@@ -224,6 +254,12 @@ public static class ConnectionFinalisation
         PduType2StatusInfo => "Status Info",
         _ => $"PDU type 0x{pduType2:x2}",
     };
+
+    /// <summary>Keep a log honest about what the parser saw in a Share Data PDU.</summary>
+    public static string Describe(ShareDataPduInfo info) =>
+        $"type2 0x{info.PduType2:x2} flags 0x{info.CompressedType:x2} "
+        + $"clen {info.CompressedLength} ulen {info.UncompressedLength} "
+        + $"shareId 0x{info.ShareId:x8} stream {info.StreamId}";
 
     private static void WriteShareControlHeader(ByteWriter w, int pduType, ushort pduSource, ushort totalLength)
     {

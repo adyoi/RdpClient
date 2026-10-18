@@ -96,6 +96,40 @@ public sealed record RdpConnectionOptions
     /// </summary>
     public SecurityModeSelection Security { get; init; } = SecurityModeSelection.Negotiate;
 
+    /// <summary>
+    /// Desktop width in pixels requested in the Bitmap Capability Set.
+    /// 1024 by default.
+    /// </summary>
+    public int DesktopWidth { get; init; } = 1024;
+
+    /// <summary>Desktop height in pixels requested in the Bitmap Capability Set. 768 by default.</summary>
+    public int DesktopHeight { get; init; } = 768;
+
+    /// <summary>
+    /// Colour depth requested in the Bitmap Capability Set. 16 by default.
+    /// </summary>
+    /// <remarks>
+    /// Sixteen is chosen because that is the one depth the Interleaved RLE
+    /// decompressor covers (2.2.9.1.1.3.1.2.4). Asking for 32 bpp makes the
+    /// server prefer the RDP 6.0 compressed form in [MS-RDPEGDI] 2.2.2.5.1,
+    /// which is a different codec and is not implemented.
+    /// </remarks>
+    public int ColourDepth { get; init; } = 16;
+
+    /// <summary>
+    /// How many graphics PDUs to read after the connection is finalised.
+    /// Zero, the default, stops at the finalisation replies; a positive value
+    /// keeps reading bitmap updates until that many have arrived or the
+    /// deadline passes.
+    /// </summary>
+    /// <remarks>
+    /// This exists because receiving graphics is the only way to prove the
+    /// bitmap path works, and a decode bug shows up as an exception rather than
+    /// as a blank window. It is bounded on purpose: a session that never stops
+    /// sending updates would otherwise never return.
+    /// </remarks>
+    public int GraphicsPduLimit { get; init; }
+
     /// <summary>TLS protocol versions to offer. Defaults to TLS 1.2 and 1.3.</summary>
     public System.Security.Authentication.SslProtocols TlsPolicy { get; init; } =
         System.Security.Authentication.SslProtocols.Tls12 |
@@ -140,12 +174,44 @@ public sealed class RdpConnection : IAsyncDisposable
     private Stream? _channel;
     private TlsChannel? _tls;
 
+    /// <summary>
+    /// One bulk decompressor for the whole connection: RDP 5.0 compression is
+    /// DEFLATE against a persistent 64 KiB history, so a match in one PDU may
+    /// refer to data from an earlier one.
+    /// </summary>
+    private readonly BulkDecompressor _bulkDecompressor = new();
+
     public HandshakeStage Stage { get; private set; } = HandshakeStage.Idle;
     public string? SelectedProtocol { get; private set; }
     public uint? NegotiatedVersion { get; private set; }
     public string? ServerNodeId { get; private set; }
     public ushort? UserId { get; private set; }
     public string? FailureReason { get; private set; }
+
+    /// <summary>The desktop size requested in the Bitmap Capability Set.</summary>
+    public int DesktopWidth { get; private set; }
+
+    /// <summary>The desktop height requested in the Bitmap Capability Set.</summary>
+    public int DesktopHeight { get; private set; }
+
+    /// <summary>The colour depth requested in the Bitmap Capability Set.</summary>
+    public int ColourDepth { get; private set; }
+
+    /// <summary>
+    /// The composited desktop, once the server has sent graphics. Null until
+    /// the first bitmap update has been painted.
+    /// </summary>
+    /// <remarks>
+    /// Exposed as a surface rather than as pixels because the caller is normally
+    /// a UI thread that needs to wrap this in a bitmap without copying it again.
+    /// </remarks>
+    public ScreenSurface? Surface { get; private set; }
+
+    /// <summary>How many graphics update PDUs have been read and painted.</summary>
+    public int GraphicsUpdatesApplied { get; private set; }
+
+    /// <summary>Raised after each batch of bitmap updates has been painted.</summary>
+    public event Action<ScreenSurface>? OnSurfaceUpdated;
 
     /// <summary>The External Security Protocol the server selected.</summary>
     public SecurityMode SecurityMode { get; private set; } = SecurityMode.None;
@@ -412,8 +478,27 @@ public sealed class RdpConnection : IAsyncDisposable
                 $"server demanded {demand.Capabilities.Count} capability sets "
                 + $"({demand.Summary}), session {demand.SessionId}");
 
+            // The Bitmap capability set is what makes the server send bitmap
+            // updates instead of GDI drawing orders (2.2.9.1.1.3.1.2). Its
+            // bitmapCompressionFlag and multipleRectangleSupport MUST both be
+            // true for a connection to proceed, so this set is mandatory once
+            // graphics are wanted - unlike the Order capability set, which this
+            // client deliberately does not send.
+            int desktopWidth = Math.Clamp(options.DesktopWidth, 640, 4096);
+            int desktopHeight = Math.Clamp(options.DesktopHeight, 480, 4096);
+            int colourDepth = options.ColourDepth;
+
+            DesktopWidth = desktopWidth;
+            DesktopHeight = desktopHeight;
+            ColourDepth = colourDepth;
+
             byte[] confirmActive = Capability.BuildConfirmActivePdu(
-                demand.ShareId, [Capability.BuildGeneralCapabilitySet()]);
+                demand.ShareId,
+                [
+                    Capability.BuildGeneralCapabilitySet(),
+                    Capability.BuildBitmapCapabilitySet(desktopWidth, desktopHeight, colourDepth),
+                    Capability.BuildFontCapabilitySet(),
+                ]);
             await SendOnGlobalChannelAsync(assigned, confirmActive, cancellationToken).ConfigureAwait(false);
             Report(HandshakeStage.ActiveConfirmed,
                 $"answered with {Capability.DescribeCapabilitySets(
@@ -436,10 +521,18 @@ public sealed class RdpConnection : IAsyncDisposable
                 .ConfigureAwait(false);
             await ReadFinalizationRepliesAsync(cancellationToken).ConfigureAwait(false);
 
+            if (options.GraphicsPduLimit > 0)
+            {
+                await ReadGraphicsAsync(options.GraphicsPduLimit, options.LogTx, cancellationToken).ConfigureAwait(false);
+            }
+
             Report(HandshakeStage.Complete,
-                "Connection finalization complete through the Synchronize, Control "
-                + "and Font List PDUs. Graphics and input are not implemented, so "
-                + "the session will not display a desktop.");
+                GraphicsUpdatesApplied > 0
+                    ? $"Connection finalization complete and {GraphicsUpdatesApplied} graphics "
+                        + $"update(s) painted onto a {DesktopWidth}x{DesktopHeight} surface."
+                    : "Connection finalization complete through the Synchronize, Control "
+                        + "and Font List PDUs. No graphics have arrived, and input is not "
+                        + "implemented, so no desktop is displayed.");
             return HandshakeStage.Complete;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -790,6 +883,160 @@ public sealed class RdpConnection : IAsyncDisposable
             throw new RdpProtocolException(
                 "the server never sent the Font Map PDU, so it may not send text");
         }
+    }
+
+    /// <summary>
+    /// Read graphics update PDUs and paint their bitmaps onto the surface,
+    /// stopping at <paramref name="limit"/> updates or when the deadline passes.
+    /// </summary>
+    /// <remarks>
+    /// A decode failure is reported rather than thrown: a server that sends one
+    /// malformed rectangle has still proved the path works for every other one,
+    /// and aborting the connection over one bad rectangle hides that.
+    /// </remarks>
+    private async Task ReadGraphicsAsync(int limit, bool hex, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(_channel);
+
+        var surface = new ScreenSurface(DesktopWidth, DesktopHeight);
+        surface.Clear(0, 0, 0);
+
+        while (GraphicsUpdatesApplied < limit)
+        {
+            ConnectionFinalisation.ShareDataPduInfo? info;
+
+            try
+            {
+                info = await ReadShareDataPduAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // The deadline, not a protocol fault: whatever arrived is kept.
+                Report(HandshakeStage.Complete,
+                    $"stopped after {GraphicsUpdatesApplied} graphics update(s): the deadline passed");
+                break;
+            }
+
+            if (info is null)
+            {
+                continue;
+            }
+
+            if (info.PduType2 != BitmapUpdate.PduType2Update)
+            {
+                // Set Error Info and Pointer PDUs are not graphics.
+                continue;
+            }
+
+            try
+            {
+                if (hex)
+                {
+                    Report(HandshakeStage.Complete,
+                        $"  raw PDU: {ConnectionFinalisation.Describe(info)} "
+                        + $"({info.RawPdu.Length} bytes) {Hex(info.RawPdu)}");
+                }
+
+                byte[] body = await ReadPduBodyAsync(info, cancellationToken).ConfigureAwait(false);
+
+                if (hex)
+                {
+                    Report(HandshakeStage.Complete,
+                        $"  UPDATE body ({body.Length} bytes) {Hex(body)}");
+                }
+
+                IReadOnlyList<BitmapUpdate.BitmapRectangle> rectangles =
+                    BitmapUpdate.ParseUpdate(body, ColourDepth);
+
+                int painted = 0;
+                foreach (BitmapUpdate.BitmapRectangle rectangle in rectangles)
+                {
+                    painted += surface.Paint(rectangle);
+                }
+
+                if (painted > 0)
+                {
+                    GraphicsUpdatesApplied++;
+                    Report(HandshakeStage.Complete,
+                        $"painted {painted} pixel(s) from {rectangles.Count} rectangle(s)");
+                    OnSurfaceUpdated?.Invoke(surface);
+                }
+            }
+            catch (NotSupportedException ex)
+            {
+                // A graphics form this client does not implement. Reported once,
+                // because it will repeat for every update of the same kind.
+                Report(HandshakeStage.Complete, $"graphics update skipped: {ex.Message}", isError: true);
+                return;
+            }
+            catch (InvalidDataException ex)
+            {
+                Report(HandshakeStage.Complete, $"malformed graphics update: {ex.Message}", isError: true);
+            }
+            catch (ArgumentOutOfRangeException ex)
+            {
+                // A graphics PDU that reaches this far with a bad field is a
+                // parse bug in one of the decoders rather than a protocol fault,
+                // so it is reported with the parameter name that failed.
+                Report(HandshakeStage.Complete,
+                    $"graphics decode failed on '{ex.ParamName}': {ex.Message} {ex.StackTrace}",
+                    isError: true);
+            }
+        }
+
+        Surface = surface;
+    }
+
+    /// <summary>
+    /// Read one Share Data PDU and return its body, i.e. the PDU content after
+    /// both headers.
+    /// </summary>
+    /// <remarks>
+    /// The body is read separately from the headers because the Share Data
+    /// Header's <c>uncompressedLength</c> is where the authority on its size
+    /// lives, and a PDU that arrives compressed has to be inflated before it can
+    /// be read at all.
+    /// </remarks>
+    private async Task<byte[]> ReadPduBodyAsync(
+        ConnectionFinalisation.ShareDataPduInfo header, CancellationToken cancellationToken)
+    {
+        // Compression is decided by the PACKET_COMPRESSED bit in compressedType, not
+        // by compressedLength being non-zero: xrdp writes the body length into
+        // compressedLength even when it did not compress anything, so testing
+        // the length alone sends an uncompressed body down the inflater.
+        bool compressed = (header.CompressedType & BulkDecompressor.PacketCompressed) != 0;
+
+        if (!compressed)
+        {
+            return header.RawPdu.AsSpan(header.BodyOffset).ToArray();
+        }
+
+        // compressedLength is the size of what actually arrived, which is not
+        // necessarily uncompressedLength: a deflated payload that expanded would
+        // otherwise be read past the end of the buffer. The body length is the
+        // authority, so the shorter of the two is what gets sliced.
+        int available = header.RawPdu.Length - header.BodyOffset;
+        int payloadLength = Math.Min(header.CompressedLength, available);
+
+        if (payloadLength <= 0)
+        {
+            throw new InvalidDataException(
+                $"the PDU declares {header.CompressedLength} compressed octets but none "
+                + "follow its headers");
+        }
+
+        if (payloadLength < header.CompressedLength)
+        {
+            Report(HandshakeStage.Complete,
+                $"the PDU declares {header.CompressedLength} compressed octets but only "
+                + $"{payloadLength} arrived; inflating what did");
+        }
+
+        // The payload is deflated against a persistent history, so the
+        // decompressor is kept for the connection rather than created per PDU.
+        return _bulkDecompressor.Decompress(
+            header.CompressedType, header.RawPdu.AsSpan(header.BodyOffset, payloadLength),
+            header.UncompressedLength);
     }
 
     /// <summary>
