@@ -901,7 +901,17 @@ public sealed class RdpConnection : IAsyncDisposable
 
         var surface = new ScreenSurface(DesktopWidth, DesktopHeight);
         surface.Clear(0, 0, 0);
-        var orders = new OrderDecoder(surface);
+
+        // Tracing every order is only useful while a stream is misparsing;
+        // without --hex it stays off so a normal run's log stays readable.
+        var orders = new OrderDecoder(surface)
+        {
+            Trace = hex
+                ? message => Report(HandshakeStage.Complete, "  " + message)
+                : null,
+        };
+
+        int ordersBefore = 0;
 
         while (GraphicsUpdatesApplied < limit)
         {
@@ -947,7 +957,7 @@ public sealed class RdpConnection : IAsyncDisposable
                         $"  UPDATE body ({body.Length} bytes) {Hex(body)}");
                 }
 
-                int ordersBefore = orders.OrdersDecoded;
+                ordersBefore = orders.OrdersDecoded;
 
                 IReadOnlyList<BitmapUpdate.BitmapRectangle> rectangles =
                     BitmapUpdate.ParseUpdate(body, ColourDepth, orders);

@@ -107,6 +107,25 @@ public sealed class OrderDecoder
     }
 
     /// <summary>
+    /// Receives one line per order and per update when
+    /// <see cref="Trace"/> is set.
+    /// </summary>
+    /// <remarks>
+    /// This is what a misparsing order stream is diagnosed with, and it is the
+    /// reason the decoder reports how many orders it managed and how many octets
+    /// were left over: a decoder that walks into a bitmap payload reports
+    /// plausible-looking order types for as long as the payload happens to
+    /// contain bytes that decode, and nothing else marks the mistake.
+    /// </remarks>
+    public Action<string>? Trace { get; init; }
+
+    /// <summary>How many orders the last update managed to decode.</summary>
+    public int OrdersInLastUpdate { get; private set; }
+
+    /// <summary>How many octets the last update had left when it finished.</summary>
+    public int BytesLeftAfterLastUpdate { get; private set; }
+
+    /// <summary>
     /// Decode the orders in one Orders Update body: updateType(2), pad2OctetsA(2),
     /// numberOrders(2), pad2OctetsB(2), then the packed orders.
     /// </summary>
@@ -131,13 +150,32 @@ public sealed class OrderDecoder
         int numberOrders = ReadU16(body, 4);
         var reader = new SpanReader(body.Slice(FixedFields));
 
+        int decoded = 0;
         for (int i = 0; i < numberOrders; i++)
         {
+            int before = reader.Remaining;
+
             if (!DecodeOne(ref reader))
             {
+                // The order the decoder could not step over is the interesting
+                // one, so its leading octets go in the log.
+                Trace?.Invoke(
+                    $"  order {decoded + 1} could not be stepped over; its octets are: "
+                    + Convert.ToHexString(
+                        reader.Slice(Math.Min(reader.Remaining, 12)).ToArray()).ToLowerInvariant());
                 break;
             }
+
+            decoded++;
+            Trace?.Invoke($"  order {decoded}: {before - reader.Remaining} octet(s), {LastOrder}");
         }
+
+        OrdersInLastUpdate = decoded;
+        BytesLeftAfterLastUpdate = reader.Remaining;
+
+        Trace?.Invoke(
+            $"orders: {decoded}/{numberOrders} decoded, {reader.Remaining} octet(s) left over"
+            + (decoded < numberOrders ? " - the stream desynchronised" : string.Empty));
     }
 
     /// <summary>Decode one order from the reader, advancing it past the order.</summary>
@@ -165,6 +203,15 @@ public sealed class OrderDecoder
 
             int available = reader.Remaining;
             int bodyLength = Math.Min(declaredLength - 6, available);
+
+            // A Cache Bitmap is the one order whose header length can be shorter
+            // than the order really is, because the pixel data length is counted
+            // in bitmapLength rather than in orderLength. Logging the two
+            // separately is what makes that visible instead of leaving the
+            // decoder to walk into a bitmap payload.
+            Trace?.Invoke(
+                $"    secondary: type {orderType}, declared total {declaredLength}, "
+                + $"body {bodyLength}, {available} available");
 
             if (bodyLength <= 0)
             {
